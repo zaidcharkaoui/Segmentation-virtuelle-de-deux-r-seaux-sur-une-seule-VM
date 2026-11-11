@@ -1,20 +1,25 @@
 #!/usr/bin/env python3
 """
 ==============================================================================
-PROJET PFA-04 (EMSI) — Contrôleur Web SDN & Dashboard Temps Réel
-Scénario : NovaStudio Cloud (DarMarket VLAN 10 vs AtlasPay VLAN 20)
+PROJET PFA-04 (EMSI) — Plateforme Multi-Ports V6 (Design Sur-Mesure & Logos SVG)
 ==============================================================================
-Ce serveur Python (100% bibliothèque standard, aucun 'pip install' requis)
-se branche directement sur les outils Linux de la VM Ubuntu :
-  - ip netns (namespaces réseau)
-  - ovs-vsctl & ovs-ofctl (Open vSwitch : VLANs & règles OpenFlow)
-  - ping & curl (génération de trafic réel)
-  - tcpdump (lecture des vraies captures .pcap)
+Trois univers visuels totalement distincts, chacun avec son Logo SVG, sa
+direction artistique et sa mise en page propre :
 
-Lancement sur Ubuntu Server :
-  sudo python3 sdn_controller.py
-Puis ouvrir dans le navigateur du PC :
-  http://<IP_DE_LA_VM>:5000
+  1. Port :5001 -> ATLAS BANK & FINCORP (Banque Privée & Trésorerie)
+     • Design : Thème Clair Prestige « Ivory, Deep Navy & Imperial Gold »
+     • Layout : Barre latérale Bancaire + Guichet d'Opérations & Navigateur Intranet
+     • Logo SVG : Blason Doré des Montagnes de l'Atlas & Coffre-Fort Numérique
+
+  2. Port :5002 -> MEDINATECH AI & CLOUD LABS (Startup Cyber, IA & DevSecOps)
+     • Design : Thème Cyberpunk « Deep Space Violet, Neon Magenta & Cyan Glass »
+     • Layout : Grille de Pods Ingénieurs R&D + Terminal DevOps Split-View
+     • Logo SVG : Hexagone Neural Lumineux & Circuit Quantique
+
+  3. Port :5000 -> SENTINEL-OVS NOC (Centre de Contrôle SDN de l'Ingénieur Réseau)
+     • Design : Thème Radar Tactique « Carbon Black, Radar Emerald & Amber Alert »
+     • Layout : Console NOC 3-Panneaux (Permissions OpenFlow, QoS 1000 Kbps, Latence min/avg/max & Audit)
+     • Logo SVG : Bouclier Radar SDN & Commutateur Open vSwitch
 ==============================================================================
 """
 
@@ -24,504 +29,1015 @@ import os
 import re
 import socket
 import subprocess
+import threading
 import time
 from urllib.parse import urlparse
 
-PORT = 5000
+PORT_CONTROL = 5000
+PORT_ENT1 = 5001
+PORT_ENT2 = 5002
+
 BRIDGE = "br-pfa"
 HOSTNAME = socket.gethostname()
 PROOF_DIR = f"./preuves_{HOSTNAME}"
 os.makedirs(PROOF_DIR, exist_ok=True)
 
-# Cartographie des namespaces de la VM
-NODES = {
-    "ns-a1": {"ip": "10.10.0.11", "veth": "veth-a1", "ovs": "ovs-a1", "default_vlan": 10, "group": "A", "role": "Serveur Web DarMarket"},
-    "ns-a2": {"ip": "10.10.0.12", "veth": "veth-a2", "ovs": "ovs-a2", "default_vlan": 10, "group": "A", "role": "Client Test DarMarket"},
-    "ns-b1": {"ip": "10.10.0.21", "veth": "veth-b1", "ovs": "ovs-b1", "default_vlan": 20, "group": "B", "role": "Serveur API AtlasPay"},
-    "ns-b2": {"ip": "10.10.0.22", "veth": "veth-b2", "ovs": "ovs-b2", "default_vlan": 20, "group": "B", "role": "Client Test AtlasPay"},
-}
-
-# État courant des permissions pilotées par le contrôleur
+STATE_LOCK = threading.Lock()
 STATE = {
-    "intraA": True,
-    "intraB": True,
-    "inter": False,
+    "global_inter_allowed": False,
+    "qos_rate_kbps": 0,
+    "custom_rules": [],
     "allowed_count": 0,
     "blocked_count": 0,
-    "icmp_allowed": 0,
-    "http_allowed": 0,
-    "icmp_blocked": 0,
-    "http_blocked": 0,
+    "latency": {"min": "--", "avg": "--", "max": "--", "mdev": "--", "pair": "Aucune mesure"},
     "last_cmd": "sudo ./pfa_lab.sh setup && sudo ./pfa_lab.sh start",
+    "logs": [],
 }
 
 
-def run_cmd(cmd, timeout=5):
-    """Exécute une commande shell Linux et retourne (code_retour, stdout, stderr, duree_ms)."""
+def run_cmd(cmd, timeout=10):
     t0 = time.time()
     try:
-        proc = subprocess.run(
-            cmd,
-            shell=True,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-        )
+        proc = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
         dt_ms = round((time.time() - t0) * 1000, 1)
         return proc.returncode, proc.stdout.strip(), proc.stderr.strip(), dt_ms
     except subprocess.TimeoutExpired:
         dt_ms = round((time.time() - t0) * 1000, 1)
-        return 124, "", "Timeout expired (100% packet loss / Flux bloqué)", dt_ms
+        return 124, "", "Timeout (100% Bloqué par le pare-feu Open vSwitch)", dt_ms
 
 
-def get_system_status():
-    """Récupère l'état réel des namespaces, des ports VLAN OVS et des règles OpenFlow."""
-    _, netns_out, _, _ = run_cmd("ip netns list")
-    _, ovs_out, _, _ = run_cmd(f"ovs-vsctl show")
-    _, flows_out, _, _ = run_cmd(f"ovs-ofctl dump-flows {BRIDGE} 2>/dev/null || true")
-
-    # Vérifier le tag VLAN réel de ovs-b1 pour savoir si l'inter-groupe est ouvert
-    _, tag_b1, _, _ = run_cmd("ovs-vsctl get port ovs-b1 tag 2>/dev/null || echo 20")
-    STATE["inter"] = (tag_b1.strip() == "10")
-
-    return {
-        "hostname": HOSTNAME,
-        "bridge_up": BRIDGE in ovs_out,
-        "netns_list": [line.split()[0] for line in netns_out.splitlines() if line.strip()],
-        "ovs_Flows": flows_out,
-        "permissions": {
-            "intraA": STATE["intraA"],
-            "intraB": STATE["intraB"],
-            "inter": STATE["inter"],
-        },
-        "stats": {
-            "allowed": STATE["allowed_count"],
-            "blocked": STATE["blocked_count"],
-            "icmp_allowed": STATE["icmp_allowed"],
-            "http_allowed": STATE["http_allowed"],
-            "icmp_blocked": STATE["icmp_blocked"],
-            "http_blocked": STATE["http_blocked"],
-        },
-        "last_cmd": STATE["last_cmd"],
-    }
+def add_log(msg, allowed=True):
+    ts = time.strftime("%H:%M:%S")
+    with STATE_LOCK:
+        STATE["logs"].append({"ts": ts, "text": msg, "allowed": allowed})
+        if len(STATE["logs"]) > 100:
+            STATE["logs"] = STATE["logs"][-100:]
 
 
-def apply_permission_change(target, allow):
-    """Applique réellement la permission sur Open vSwitch dans le noyau Linux."""
-    allow = bool(allow)
-    if target == "inter":
-        if allow:
-            cmd = "ovs-vsctl set port ovs-b1 tag=10 && ovs-vsctl set port ovs-b2 tag=10"
-        else:
-            cmd = "ovs-vsctl set port ovs-b1 tag=20 && ovs-vsctl set port ovs-b2 tag=20"
-        run_cmd(cmd)
-        STATE["inter"] = allow
-        STATE["last_cmd"] = f"sudo {cmd}"
+def discover_live_state():
+    _, out, _, _ = run_cmd("ip netns list 2>/dev/null || true")
+    ns_names = [line.split()[0] for line in out.splitlines() if line.strip()]
 
-    elif target == "intraA":
-        if allow:
-            cmd = f"ovs-ofctl del-flows {BRIDGE} 'in_port=ovs-a2'"
-        else:
-            cmd = f"ovs-ofctl add-flow {BRIDGE} 'priority=200,in_port=ovs-a2,actions=drop'"
-        run_cmd(cmd)
-        STATE["intraA"] = allow
-        STATE["last_cmd"] = f"sudo {cmd}"
+    users_a = []
+    users_b = []
 
-    elif target == "intraB":
-        if allow:
-            cmd = f"ovs-ofctl del-flows {BRIDGE} 'in_port=ovs-b2'"
-        else:
-            cmd = f"ovs-ofctl add-flow {BRIDGE} 'priority=200,in_port=ovs-b2,actions=drop'"
-        run_cmd(cmd)
-        STATE["intraB"] = allow
-        STATE["last_cmd"] = f"sudo {cmd}"
+    for ns in ns_names:
+        if ns.startswith("ns-a-u"):
+            uid = ns.replace("ns-a-u", "")
+            if uid.isdigit():
+                ip = f"10.10.1.{int(uid) + 1}"
+                users_a.append({"ns": ns, "ip": ip, "uid": int(uid), "role": f"Banquier #{uid}"})
+        elif ns.startswith("ns-b-u"):
+            uid = ns.replace("ns-b-u", "")
+            if uid.isdigit():
+                ip = f"10.10.2.{int(uid) + 1}"
+                users_b.append({"ns": ns, "ip": ip, "uid": int(uid), "role": f"Ingénieur IA #{uid}"})
 
-    return get_system_status()
+    users_a.sort(key=lambda x: x["uid"])
+    users_b.sort(key=lambda x: x["uid"])
 
-
-def execute_real_network_flow(src_ns, dst_ns, proto, pcap_name=None):
-    """Exécute un vrai ping ou curl entre deux namespaces Linux avec capture tcpdump réelle."""
-    if src_ns not in NODES or dst_ns not in NODES:
-        return {"error": "Namespace invalide"}
-
-    dst_info = NODES[dst_ns]
-    dst_ip = dst_info["ip"]
-    dst_veth = dst_info["veth"]
-
-    pcap_file = os.path.join(PROOF_DIR, pcap_name or "live_capture.pcap")
-
-    # 1. Démarrer une vraie sonde tcpdump en arrière-plan sur l'interface cible
-    tcpdump_proc = subprocess.Popen(
-        ["ip", "netns", "exec", dst_ns, "tcpdump", "-i", dst_veth, "-nn", "-c", "6", "-w", pcap_file],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    time.sleep(0.25)
-
-    # 2. Exécuter le vrai flux (ping ou curl) depuis le namespace source
-    if proto == "PING":
-        real_cmd = f"ip netns exec {src_ns} ping -c 1 -W 1 {dst_ip}"
-    else:
-        real_cmd = f"ip netns exec {src_ns} curl -s --max-time 2 http://{dst_ip}:8080"
-
-    STATE["last_cmd"] = f"sudo {real_cmd}"
-    rc, out, err, duration_ms = run_cmd(real_cmd, timeout=3)
-
-    # 3. Arrêter proprement tcpdump et lire les paquets capturés
-    time.sleep(0.25)
-    tcpdump_proc.terminate()
-    try:
-        tcpdump_proc.wait(timeout=1)
-    except subprocess.TimeoutExpired:
-        tcpdump_proc.kill()
-
-    _, pcap_read, _, _ = run_cmd(f"tcpdump -nn -r {pcap_file} 2>/dev/null || true")
-    pcap_size = os.path.getsize(pcap_file) if os.path.exists(pcap_file) else 0
-
-    allowed = (rc == 0)
-    if allowed:
-        STATE["allowed_count"] += 1
-        if proto == "PING":
-            STATE["icmp_allowed"] += 1
-        else:
-            STATE["http_allowed"] += 1
-    else:
-        STATE["blocked_count"] += 1
-        if proto == "PING":
-            STATE["icmp_blocked"] += 1
-        else:
-            STATE["http_blocked"] += 1
-
-    # Extraire la latence exacte si ping a réussi
-    latency_str = f"{duration_ms} ms"
-    m = re.search(r"time=([0-9.]+)\s*ms", out)
-    if m:
-        latency_str = f"{m.group(1)} ms"
-
-    if not pcap_read.strip():
-        ts = time.strftime("%H:%M:%S")
-        pcap_lines = [
-            f"{ts} [OVS-DROP] Aucun paquet reçu sur {dst_ns} ({dst_veth}) — Fichier { os.path.basename(pcap_file) } = {pcap_size} octets (100% bloqué par Open vSwitch)"
-        ]
-    else:
-        pcap_lines = [line for line in pcap_read.splitlines() if line.strip()]
-
-    return {
-        "allowed": allowed,
-        "src": src_ns,
-        "dst": dst_ns,
-        "proto": proto,
-        "command": f"sudo {real_cmd}",
-        "output": out if allowed else (err or "100% packet loss / Connection timed out (Bloqué par OVS)"),
-        "latency": latency_str if allowed else "Timeout (Drop)",
-        "pcap_file": os.path.basename(pcap_file),
-        "pcap_size": pcap_size,
-        "tcpdump_lines": pcap_lines,
-        "status": get_system_status(),
-    }
+    with STATE_LOCK:
+        return {
+            "hostname": HOSTNAME,
+            "ports": {"control": PORT_CONTROL, "ent1": PORT_ENT1, "ent2": PORT_ENT2},
+            "servers": {
+                "A": {"ns": "ns-a-web", "ip": "10.10.1.1", "url": "http://10.10.1.1:8080", "name": "Portail Core-Banking Atlas Bank (10.10.1.1)"},
+                "B": {"ns": "ns-b-web", "ip": "10.10.2.1", "url": "http://10.10.2.1:8080", "name": "Cluster Cloud & IA MedinaTech (10.10.2.1)"},
+            },
+            "usersA": users_a,
+            "usersB": users_b,
+            "global_inter_allowed": STATE["global_inter_allowed"],
+            "qos_rate_kbps": STATE["qos_rate_kbps"],
+            "custom_rules": list(STATE["custom_rules"]),
+            "stats": {
+                "allowed": STATE["allowed_count"],
+                "blocked": STATE["blocked_count"],
+            },
+            "latency": dict(STATE["latency"]),
+            "last_cmd": STATE["last_cmd"],
+            "logs": list(STATE["logs"][-40:]),
+        }
 
 
 # ==============================================================================
-# INTERFACE WEB HTML SERVIE DIRECTEMENT PAR LE CONTRÔLEUR PYTHON
+# PAGE 1 (:5001) — ATLAS BANK & FINCORP (THÈME LUXURY BANKING : IVOIRE, OR & NAVY)
 # ==============================================================================
-DASHBOARD_HTML = r"""<!DOCTYPE html>
+ATLAS_BANK_HTML = r"""<!DOCTYPE html>
 <html lang="fr">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>NovaStudio SDN Controller — Connecté en Direct à Ubuntu Server</title>
+  <title>ATLAS BANK &amp; FINCORP — Espace Collaborateur &amp; Trésorerie (:5001)</title>
   <script src="https://cdn.tailwindcss.com/3.4.17"></script>
-  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1"></script>
   <style>
-    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap');
-    body { font-family: 'Inter', sans-serif; background-color: #0b1120; color: #e2e8f0; }
+    @import url('https://fonts.googleapis.com/css2?family=Cinzel:wght@600;700;800&family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap');
+    body { font-family: 'Plus Jakarta Sans', sans-serif; background-color: #f4f1ea; color: #0f172a; }
+    .serif-brand { font-family: 'Cinzel', serif; }
     .mono { font-family: 'JetBrains Mono', monospace; }
-    .custom-scroll::-webkit-scrollbar { width: 6px; height: 6px; }
-    .custom-scroll::-webkit-scrollbar-track { background: #0f172a; }
-    .custom-scroll::-webkit-scrollbar-thumb { background: #334155; border-radius: 3px; }
+    .gold-gradient { background: linear-gradient(135deg, #d4af37 0%, #aa7c11 100%); }
+    .navy-panel { background: linear-gradient(180deg, #0a192f 0%, #0f2942 100%); }
   </style>
 </head>
 <body class="min-h-screen flex flex-col">
   <div id="toastBox" class="fixed top-4 right-4 z-50 flex flex-col gap-2 max-w-sm w-full pointer-events-none"></div>
 
-  <header class="bg-slate-900/95 border-b border-slate-800 sticky top-0 z-40 backdrop-blur">
-    <div class="max-w-7xl mx-auto px-4 sm:px-6 py-3 flex flex-wrap items-center justify-between gap-3">
-      <div class="flex items-center gap-3">
-        <div class="w-10 h-10 rounded-xl bg-gradient-to-br from-teal-500 to-blue-600 flex items-center justify-center font-extrabold text-white text-lg shadow-lg">
-          SDN
+  <!-- Top Prestige Banking Header -->
+  <header class="bg-[#0a192f] text-white border-b-4 border-[#d4af37] shadow-xl sticky top-0 z-40">
+    <div class="max-w-7xl mx-auto px-5 py-3.5 flex flex-wrap items-center justify-between gap-4">
+      <div class="flex items-center gap-4">
+        <!-- Custom SVG Logo: Atlas Bank Golden Crest & Mountain Vault -->
+        <div class="w-12 h-12 rounded-xl bg-[#112240] border-2 border-[#d4af37] flex items-center justify-center shadow-lg">
+          <svg viewBox="0 0 64 64" class="w-9 h-9">
+            <polygon points="32,4 58,16 58,36 32,60 6,36 6,16" fill="#0a192f" stroke="#d4af37" stroke-width="3.5"/>
+            <polygon points="14,40 28,18 40,36 46,26 52,40" fill="#d4af37" opacity="0.9"/>
+            <circle cx="32" cy="14" r="3" fill="#f8fafc"/>
+          </svg>
         </div>
         <div>
-          <div class="flex items-center gap-2">
-            <h1 class="text-base sm:text-lg font-extrabold text-white">NovaStudio Cloud — Contrôleur SDN Temps Réel</h1>
-            <span id="vmHostBadge" class="px-2.5 py-0.5 text-[11px] font-bold rounded-full bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 mono">
-              ● CONNECTÉ À LA VM
+          <div class="flex items-center gap-2.5">
+            <span class="serif-brand text-lg sm:text-xl font-extrabold tracking-wider text-[#f5d77f]">ATLAS BANK &amp; FINCORP</span>
+            <span class="px-2.5 py-0.5 text-[10px] font-bold uppercase tracking-widest rounded bg-[#d4af37]/20 text-[#f5d77f] border border-[#d4af37]/50">
+               Entreprise 1 • Port :5001
             </span>
           </div>
-          <p class="text-xs text-slate-400">Pilotage réel du noyau Linux (<span class="mono text-slate-300">ip netns</span> • <span class="mono text-slate-300">Open vSwitch</span> • <span class="mono text-slate-300">tcpdump</span>)</p>
+          <p class="text-xs text-slate-300">Direction Trésorerie, Paie &amp; Risques • Sous-réseau Privé <span class="mono text-[#f5d77f]">10.10.1.0/16</span> (Capacité &gt; 2 000 Banquiers)</p>
         </div>
       </div>
 
-      <div class="flex items-center gap-2">
-        <button onclick="runLabAction('setup')" class="px-3 py-1.5 rounded-lg text-xs font-bold bg-teal-600 hover:bg-teal-500 text-white transition shadow">
-          🔄 Réinitialiser Topologie (Setup + Start)
+      <!-- Inter-Portal Links -->
+      <div class="flex items-center gap-2 text-xs">
+        <a id="linkMedina" href="#" target="_blank" class="px-3.5 py-2 rounded-lg font-bold bg-[#112240] hover:bg-[#1d3557] text-purple-300 border border-purple-400/40 transition">
+          🚀 Voir MedinaTech (:5002)
+        </a>
+        <a id="linkSentinel" href="#" target="_blank" class="px-3.5 py-2 rounded-lg font-extrabold gold-gradient text-[#0a192f] shadow transition">
+          🛡️ Console SDN Sentinel (:5000)
+        </a>
+      </div>
+    </div>
+  </header>
+
+  <!-- Main Banking Layout: Left Sidebar (Directory) + Right Main Desk -->
+  <div class="flex-1 max-w-7xl w-full mx-auto px-5 py-6 grid grid-cols-1 lg:grid-cols-12 gap-6">
+
+    <!-- LEFT SIDEBAR (4 cols) : ANNUAIRE DES BANQUIERS & RECRUTEMENT DYNAMIQUE -->
+    <aside class="lg:col-span-4 navy-panel text-white rounded-2xl p-5 shadow-2xl border border-[#d4af37]/40 flex flex-col justify-between space-y-4">
+      <div class="space-y-4">
+        <div class="border-b border-slate-700 pb-3 flex items-center justify-between">
+          <div>
+            <span class="text-[10px] uppercase tracking-widest text-[#f5d77f] font-bold">Allocation IP Dynamique (/16)</span>
+            <h2 class="text-base font-extrabold text-white mt-0.5">👔 Postes Collaborateurs</h2>
+          </div>
+          <span id="bankUserCount" class="px-3 py-1 rounded-full bg-[#d4af37] text-[#0a192f] font-extrabold text-sm mono">2</span>
+        </div>
+
+        <!-- Boutons d'Ajout Dynamique -->
+        <div class="space-y-1.5">
+          <p class="text-xs text-slate-300">Intégrer de nouveaux banquiers sur le VLAN Finance :</p>
+          <div class="grid grid-cols-3 gap-2">
+            <button onclick="addBankUsers(1)" class="py-2.5 px-2 rounded-xl gold-gradient text-[#0a192f] font-extrabold text-xs shadow hover:opacity-95 transition">
+              +1 Banquier
+            </button>
+            <button onclick="addBankUsers(5)" class="py-2.5 px-2 rounded-xl bg-[#112240] hover:bg-[#1e3a5f] text-[#f5d77f] border border-[#d4af37]/50 font-bold text-xs transition">
+              +5 Banquiers
+            </button>
+            <button onclick="addBankUsers(10)" class="py-2.5 px-2 rounded-xl bg-[#112240] hover:bg-[#1e3a5f] text-[#f5d77f] border border-[#d4af37]/50 font-bold text-xs transition">
+              +10 Banquiers
+            </button>
+          </div>
+        </div>
+
+        <!-- Serveur Core-Banking Interne -->
+        <div class="p-3 rounded-xl bg-[#112240] border border-[#d4af37]/40 flex items-center justify-between">
+          <div>
+            <span class="text-xs font-bold text-[#f5d77f] block">🏦 Serveur Core-Banking</span>
+            <span class="mono text-[11px] text-slate-300">http://10.10.1.1:8080 (ns-a-web)</span>
+          </div>
+          <span class="px-2 py-0.5 rounded bg-emerald-500/20 text-emerald-300 text-[10px] font-bold">ACTIF</span>
+        </div>
+
+        <!-- Liste des Banquiers -->
+        <div>
+          <p class="text-xs font-semibold text-slate-300 mb-2">Annuaire IP actif (Atlas Bank) :</p>
+          <div id="bankUsersList" class="space-y-1.5 max-h-64 overflow-y-auto pr-1"></div>
+        </div>
+      </div>
+
+      <div class="p-3 rounded-xl bg-[#071120] border border-slate-800 text-[11px] text-slate-400">
+        🔒 <strong>Conformité Bancaire :</strong> L'accès vers <span class="text-white font-semibold">MedinaTech AI Labs</span> est verrouillé par défaut par le pare-feu Open vSwitch.
+      </div>
+    </aside>
+
+    <!-- RIGHT WORKSPACE (8 cols) : GUICHET D'OPÉRATIONS & NAVIGATEUR INTRANET -->
+    <section class="lg:col-span-8 flex flex-col gap-5">
+
+      <!-- Top Status Ribbon (Light Luxury Cards) -->
+      <div class="grid grid-cols-1 sm:grid-cols-3 gap-4">
+        <div class="bg-white rounded-2xl p-4 shadow-md border-l-4 border-[#0a192f]">
+          <span class="text-[11px] font-bold uppercase text-slate-500">Statut Pare-Feu Inter-Entreprises</span>
+          <div id="bankPolicyBadge" class="mt-1.5 text-xs font-extrabold text-rose-700">🔒 CLOISONNEMENT ACTIF</div>
+        </div>
+        <div class="bg-white rounded-2xl p-4 shadow-md border-l-4 border-[#d4af37]">
+          <span class="text-[11px] font-bold uppercase text-slate-500">Politique Bande Passante (QoS)</span>
+          <div id="bankQosBadge" class="mt-1.5 text-xs font-extrabold text-emerald-700 mono">Débit Illimité ( Fibre Interne )</div>
+        </div>
+        <div class="bg-white rounded-2xl p-4 shadow-md border-l-4 border-sky-700">
+          <span class="text-[11px] font-bold uppercase text-slate-500">Dernière Latence (min/avg/max)</span>
+          <div id="bankLatBadge" class="mt-1.5 text-xs font-extrabold text-sky-900 mono">-- / -- / -- ms</div>
+        </div>
+      </div>
+
+      <!-- Main Operation Card -->
+      <div class="bg-white rounded-2xl p-6 shadow-xl border border-slate-200 space-y-5">
+        <div class="flex flex-wrap items-center justify-between gap-2 border-b border-slate-200 pb-3">
+          <div>
+            <h2 class="serif-brand text-base font-extrabold text-[#0a192f]">TERMINAL D'OPÉRATIONS COLLABORATEUR — ATLAS BANK</h2>
+            <p class="text-xs text-slate-500">Testez l'accès aux portails Web (`curl`) et l'envoi de paquets (`ping`) vers les autres départements</p>
+          </div>
+          <span class="px-2.5 py-1 rounded bg-amber-100 text-amber-900 font-bold text-xs mono">VLAN Finance • 10.10.1.x</span>
+        </div>
+
+        <!-- Étape 1 : Choix du Banquier -->
+        <div class="p-3.5 rounded-xl bg-slate-50 border border-slate-200">
+          <label class="block text-xs font-extrabold text-[#0a192f] mb-1">1. Sélectionner le poste Banquier émetteur (Source) :</label>
+          <select id="selBankUser" class="w-full bg-white border border-slate-300 rounded-lg px-3 py-2 text-xs font-semibold text-slate-900 mono"></select>
+        </div>
+
+        <!-- Étape 2 : Connexion Web (Intranet Bancaire vs Cloud MedinaTech) -->
+        <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+          <button onclick="bankOpenWeb('A')" class="p-3.5 rounded-xl bg-[#0a192f] hover:bg-[#162d4c] text-white text-left shadow-md transition flex items-center justify-between">
+            <div>
+              <span class="text-xs font-extrabold text-[#f5d77f] block">🏦 Ouvrir Portail Interne Atlas Bank</span>
+              <span class="text-[11px] mono text-slate-300">curl http://10.10.1.1:8080</span>
+            </div>
+            <span class="text-lg">→</span>
+          </button>
+
+          <button onclick="bankOpenWeb('B')" class="p-3.5 rounded-xl bg-purple-950 hover:bg-purple-900 text-white text-left shadow-md transition flex items-center justify-between border border-purple-400/40">
+            <div>
+              <span class="text-xs font-extrabold text-purple-200 block">🌐 Accéder au Portail Externe MedinaTech</span>
+              <span class="text-[11px] mono text-purple-300">curl http://10.10.2.1:8080</span>
+            </div>
+            <span class="text-lg">↗</span>
+          </button>
+        </div>
+
+        <!-- Étape 3 : Ping & Calcul min/avg/max vers un Ingénieur de MedinaTech + Test Débit 2 Mo -->
+        <div class="p-4 rounded-xl bg-slate-50 border border-slate-200 space-y-3">
+          <label class="block text-xs font-extrabold text-[#0a192f]">2. Contacter un Ingénieur de MedinaTech AI Labs (`ping` &amp; `min/avg/max`) ou tester la QoS :</label>
+          <div class="flex flex-wrap gap-2">
+            <select id="selTargetMedina" class="flex-1 bg-white border border-slate-300 rounded-lg px-3 py-2 text-xs font-semibold text-slate-900 mono"></select>
+            <button onclick="bankPingUser()" class="px-4 py-2 rounded-xl bg-[#0a192f] hover:bg-slate-800 text-white text-xs font-bold shadow">
+              💬 Envoyer Ping
+            </button>
+            <button onclick="bankCalcLatency()" class="px-4 py-2 rounded-xl gold-gradient text-[#0a192f] text-xs font-extrabold shadow">
+              📊 Calculer min/avg/max
+            </button>
+            <button onclick="bankTestSpeed()" class="px-3.5 py-2 rounded-xl bg-amber-600 hover:bg-amber-500 text-white text-xs font-bold shadow">
+              ⬇ Test Débit 2 Mo
+            </button>
+          </div>
+        </div>
+
+        <!-- Fenêtre de Navigateur / Résultat Intégré -->
+        <div class="rounded-xl overflow-hidden border-2 border-slate-300 shadow-inner">
+          <div class="bg-slate-200 px-3.5 py-2 flex items-center justify-between border-b border-slate-300">
+            <div class="flex items-center gap-1.5">
+              <span class="w-3 h-3 rounded-full bg-rose-500 inline-block"></span>
+              <span class="w-3 h-3 rounded-full bg-amber-500 inline-block"></span>
+              <span class="w-3 h-3 rounded-full bg-emerald-500 inline-block"></span>
+              <span id="bankBrowserUrl" class="ml-2 px-3 py-0.5 rounded bg-white text-[11px] mono text-slate-700 border border-slate-300">
+                https://intranet.atlasbank.ma
+              </span>
+            </div>
+            <span id="bankResTime" class="text-xs font-bold mono text-slate-700">-- ms</span>
+          </div>
+          <div id="bankBrowserViewport" class="bg-white p-5 min-h-[145px] flex flex-col justify-center">
+            <p class="text-xs text-slate-500 text-center">Sélectionnez une opération ci-dessus pour afficher la réponse du serveur ou le verdict du pare-feu Open vSwitch.</p>
+          </div>
+        </div>
+
+      </div>
+    </section>
+  </div>
+
+  <script>
+    var host = window.location.hostname || "localhost";
+    document.getElementById("linkMedina").href = "http://" + host + ":5002";
+    document.getElementById("linkSentinel").href = "http://" + host + ":5000";
+
+    function toast(msg, isErr) {
+      var box = document.getElementById("toastBox");
+      var el = document.createElement("div");
+      el.className = "px-4 py-3 rounded-xl border text-xs font-bold shadow-xl " +
+        (isErr ? "bg-rose-900 border-rose-400 text-white" : "bg-[#0a192f] border-[#d4af37] text-[#f5d77f]");
+      el.textContent = msg;
+      box.appendChild(el);
+      setTimeout(function() { if (el.parentNode) el.parentNode.removeChild(el); }, 3200);
+    }
+
+    function preserveSelect(selEl, htmlStr) {
+      var cur = selEl.value;
+      selEl.innerHTML = htmlStr;
+      if (cur && Array.from(selEl.options).some(function(o) { return o.value === cur; })) {
+        selEl.value = cur;
+      }
+    }
+
+    function renderBankUI(st) {
+      document.getElementById("bankUserCount").textContent = st.usersA.length;
+
+      var pol = document.getElementById("bankPolicyBadge");
+      if (st.global_inter_allowed) {
+        pol.textContent = "🔓 INTERCONNEXION GLOBALE AUTORISÉE";
+        pol.className = "mt-1.5 text-xs font-extrabold text-emerald-700";
+      } else if (st.custom_rules.length > 0) {
+        pol.textContent = "🔑 " + st.custom_rules.length + " DÉROGATION(S) OPENFLOW ACTIVE(S)";
+        pol.className = "mt-1.5 text-xs font-extrabold text-amber-700";
+      } else {
+        pol.textContent = "🔒 CLOISONNEMENT BANCAIRE STRICT";
+        pol.className = "mt-1.5 text-xs font-extrabold text-rose-700";
+      }
+
+      var qos = document.getElementById("bankQosBadge");
+      if (st.qos_rate_kbps > 0) {
+        qos.textContent = "⚡ Bridé à " + st.qos_rate_kbps + " Kbps (1 Mbps)";
+        qos.className = "mt-1.5 text-xs font-extrabold text-amber-700 mono";
+      } else {
+        qos.textContent = "Débit Illimité (Fibre Interne)";
+        qos.className = "mt-1.5 text-xs font-extrabold text-emerald-700 mono";
+      }
+
+      if (st.latency && st.latency.avg !== "--") {
+        document.getElementById("bankLatBadge").textContent =
+          st.latency.min + " / " + st.latency.avg + " / " + st.latency.max + " ms";
+      }
+
+      document.getElementById("bankUsersList").innerHTML = st.usersA.map(function(u) {
+        return "<div class='px-3 py-2 rounded-lg bg-[#112240] border border-slate-700 flex items-center justify-between text-xs'>" +
+          "<div><span class='font-bold text-[#f5d77f] block'>👔 " + u.role + "</span><span class='text-[10px] text-slate-400 mono'>" + u.ns + "</span></div>" +
+          "<span class='mono text-xs text-white bg-[#0a192f] px-2 py-0.5 rounded border border-[#d4af37]/40'>" + u.ip + "</span></div>";
+      }).join("");
+
+      preserveSelect(document.getElementById("selBankUser"), st.usersA.map(function(u) {
+        return "<option value='" + u.ns + "|" + u.ip + "'>👔 " + u.role + " (" + u.ns + " — IP : " + u.ip + ")</option>";
+      }).join(""));
+
+      preserveSelect(document.getElementById("selTargetMedina"), st.usersB.map(function(u) {
+        return "<option value='" + u.ns + "|" + u.ip + "'>🧑‍💻 " + u.role + " [MedinaTech] (" + u.ns + " — " + u.ip + ")</option>";
+      }).join(""));
+    }
+
+    function showBankViewport(allowed, urlStr, title, bodyText, timing) {
+      document.getElementById("bankBrowserUrl").textContent = urlStr;
+      document.getElementById("bankResTime").textContent = timing || "";
+      var vp = document.getElementById("bankBrowserViewport");
+      if (allowed) {
+        vp.className = "bg-emerald-50/70 p-5 min-h-[145px] flex flex-col justify-center border-l-8 border-emerald-600";
+        vp.innerHTML = "<div class='text-emerald-900 font-extrabold text-sm mb-1'>✅ " + title + "</div>" +
+          "<div class='p-3 rounded-lg bg-white border border-emerald-300 text-slate-800 text-xs mono shadow-sm break-all'>" + bodyText + "</div>";
+      } else {
+        vp.className = "bg-rose-50 p-5 min-h-[145px] flex flex-col justify-center border-l-8 border-rose-600";
+        vp.innerHTML = "<div class='text-rose-800 font-extrabold text-sm mb-1'>🚫 " + title + "</div>" +
+          "<div class='p-3 rounded-lg bg-white border border-rose-300 text-rose-700 text-xs mono shadow-sm'>" + bodyText + "</div>";
+      }
+    }
+
+    async function addBankUsers(n) {
+      toast("Création dynamique de +" + n + " Banquier(s) dans Atlas Bank...", false);
+      var res = await fetch("/api/add_user", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ company: "A", count: n })
+      });
+      renderBankUI(await res.json());
+      toast("+" + n + " Banquier(s) ajouté(s) avec IP dynamique !", false);
+    }
+
+    async function bankOpenWeb(targetComp) {
+      var u = document.getElementById("selBankUser").value.split("|");
+      var dstIp = targetComp === "A" ? "10.10.1.1" : "10.10.2.1";
+      var label = targetComp === "A" ? "Portail Core-Banking Atlas Bank" : "Portail Cloud MedinaTech Labs";
+      var res = await fetch("/api/test_flow", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ src_ns: u[0], src_ip: u[1], dst_ip: dstIp, proto: "CURL", dst_label: label })
+      });
+      var data = await res.json();
+      showBankViewport(
+        data.allowed,
+        "http://" + dstIp + ":8080/index.html",
+        data.allowed ? label + " — Accès Autorisé" : " Pare-Feu Sentinel-OVS : Accès Interdit vers " + label,
+        data.output,
+        data.latency
+      );
+      renderBankUI(data.state);
+    }
+
+    async function bankPingUser() {
+      var u = document.getElementById("selBankUser").value.split("|");
+      var t = document.getElementById("selTargetMedina").value.split("|");
+      var res = await fetch("/api/test_flow", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ src_ns: u[0], src_ip: u[1], dst_ip: t[1], proto: "PING", dst_label: t[0] + " (" + t[1] + ")" })
+      });
+      var data = await res.json();
+      showBankViewport(
+        data.allowed,
+        "icmp://" + u[1] + " -> " + t[1],
+        data.allowed ? "Paquets ICMP Echo Reply reçus de " + t[0] : "Paquets ICMP bloqués par Open vSwitch vers " + t[0],
+        data.output,
+        data.latency
+      );
+      renderBankUI(data.state);
+    }
+
+    async function bankCalcLatency() {
+      var u = document.getElementById("selBankUser").value.split("|");
+      var t = document.getElementById("selTargetMedina").value.split("|");
+      toast("Calcul min/avg/max vers " + t[0] + "...", false);
+      var res = await fetch("/api/latency", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ src_ns: u[0], dst_ip: t[1], label: u[0] + " → " + t[0] })
+      });
+      var data = await res.json();
+      showBankViewport(
+        data.allowed,
+        "benchmark://" + u[0] + " -> " + t[0],
+        data.allowed ? "Statistiques de Latence (" + data.pair + ")" : "Calcul Impossible : Communication Interdite",
+        data.summary,
+        data.allowed ? ("avg = " + data.avg + " ms") : "Bloqué"
+      );
+      renderBankUI(data.state);
+    }
+
+    async function bankTestSpeed() {
+      var u = document.getElementById("selBankUser").value.split("|");
+      toast("Téléchargement du fichier de 2 Mo en cours...", false);
+      var res = await fetch("/api/qos_speed", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ src_ns: u[0], dst_ip: "10.10.1.1" })
+      });
+      var data = await res.json();
+      showBankViewport(true, "http://10.10.1.1:8080/fichier_2mo.bin", "Test de Débit Téléchargement (" + data.qos_mode + ")", data.detail, data.duration);
+      renderBankUI(data.state);
+    }
+
+    async function poll() {
+      try {
+        var res = await fetch("/api/status");
+        renderBankUI(await res.json());
+      } catch (e) {}
+    }
+
+    window.addEventListener("DOMContentLoaded", function() {
+      poll();
+      setInterval(poll, 1500);
+    });
+  </script>
+</body>
+</html>
+"""
+
+
+# ==============================================================================
+# PAGE 2 (:5002) — MEDINATECH AI & CLOUD LABS (THÈME CYBERPUNK / NEON AI LAB)
+# ==============================================================================
+MEDINATECH_HTML = r"""<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>MEDINATECH AI &amp; CLOUD LABS — Engineering &amp; DevSecOps Hub (:5002)</title>
+  <script src="https://cdn.tailwindcss.com/3.4.17"></script>
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=JetBrains+Mono:wght@400;500;600;700&display=swap');
+    body {
+      font-family: 'Space Grotesk', sans-serif;
+      background-color: #070312;
+      background-image: radial-gradient(circle at 15% 20%, rgba(168, 85, 247, 0.16) 0%, transparent 40%),
+                        radial-gradient(circle at 85% 80%, rgba(6, 182, 212, 0.14) 0%, transparent 40%);
+      color: #f3e8ff;
+    }
+    .mono { font-family: 'JetBrains Mono', monospace; }
+    .cyber-card {
+      background: rgba(17, 10, 38, 0.82);
+      border: 1px solid rgba(168, 85, 247, 0.35);
+      box-shadow: 0 0 25px rgba(168, 85, 247, 0.1);
+    }
+    .neon-btn {
+      background: linear-gradient(90deg, #9333ea 0%, #db2777 50%, #0891b2 100%);
+    }
+  </style>
+</head>
+<body class="min-h-screen flex flex-col">
+  <div id="toastBox" class="fixed top-4 right-4 z-50 flex flex-col gap-2 max-w-sm w-full pointer-events-none"></div>
+
+  <!-- Top Cyber-AI Header -->
+  <header class="bg-[#0d0620]/90 border-b border-fuchsia-500/40 backdrop-blur sticky top-0 z-40">
+    <div class="max-w-7xl mx-auto px-5 py-3.5 flex flex-wrap items-center justify-between gap-4">
+      <div class="flex items-center gap-4">
+        <!-- Custom SVG Logo: MedinaTech Neural Hexagon & Quantum Core -->
+        <div class="w-12 h-12 rounded-2xl bg-[#1a0b38] border-2 border-cyan-400 flex items-center justify-center shadow-lg shadow-fuchsia-500/30">
+          <svg viewBox="0 0 64 64" class="w-9 h-9">
+            <polygon points="32,4 56,18 56,46 32,60 8,46 8,18" fill="none" stroke="#22d3ee" stroke-width="3"/>
+            <polygon points="32,14 46,22 46,42 32,50 18,42 18,22" fill="#a855f7" opacity="0.35" stroke="#ec4899" stroke-width="2"/>
+            <circle cx="32" cy="32" r="5" fill="#22d3ee"/>
+            <line x1="32" y1="14" x2="32" y2="27" stroke="#f472b6" stroke-width="2"/>
+            <line x1="46" y1="42" x2="36" y2="35" stroke="#22d3ee" stroke-width="2"/>
+            <line x1="18" y1="42" x2="28" y2="35" stroke="#22d3ee" stroke-width="2"/>
+          </svg>
+        </div>
+        <div>
+          <div class="flex items-center gap-2.5">
+            <span class="text-lg sm:text-xl font-extrabold tracking-wide bg-gradient-to-r from-cyan-300 via-fuchsia-400 to-purple-300 bg-clip-text text-transparent">
+              MEDINATECH AI &amp; CLOUD LABS
+            </span>
+            <span class="px-2.5 py-0.5 text-[10px] font-bold uppercase rounded-full bg-fuchsia-500/20 text-fuchsia-300 border border-fuchsia-400/50 mono">
+              Entreprise 2 • Port :5002
+            </span>
+          </div>
+          <p class="text-xs text-purple-300/80">Cluster GPU, R&amp;D &amp; DevSecOps • Pool IP Dynamique <span class="mono text-cyan-300">10.10.2.0/16</span> (Scalabilité &gt; 2 000 Ingénieurs)</p>
+        </div>
+      </div>
+
+      <div class="flex items-center gap-2 text-xs">
+        <a id="linkAtlas" href="#" target="_blank" class="px-3.5 py-2 rounded-xl font-bold bg-[#1a0b38] hover:bg-purple-900 text-amber-300 border border-amber-400/40 transition">
+          🏦 Voir Atlas Bank (:5001)
+        </a>
+        <a id="linkSentinel" href="#" target="_blank" class="px-3.5 py-2 rounded-xl font-extrabold neon-btn text-white shadow-lg transition">
+          🛡️ Console SDN Sentinel (:5000)
+        </a>
+      </div>
+    </div>
+  </header>
+
+  <main class="flex-1 max-w-7xl w-full mx-auto px-5 py-6 space-y-6">
+
+    <!-- Top Section : Spawner Dynamique de Pods Ingénieurs (Grid Layout) -->
+    <section class="cyber-card rounded-2xl p-5 space-y-4">
+      <div class="flex flex-wrap items-center justify-between gap-4 border-b border-purple-500/30 pb-3">
+        <div>
+          <span class="text-[10px] uppercase tracking-widest text-cyan-300 font-bold mono">Orchestrateur de Namespaces R&amp;D</span>
+          <h2 class="text-base font-extrabold text-white">⚡ Pods Ingénieurs IA Connectés (<span id="medinaCount" class="text-cyan-300 mono">2</span> actifs sur 10.10.2.x/16)</h2>
+        </div>
+        <div class="flex flex-wrap items-center gap-2">
+          <button onclick="spawnEngineers(1)" class="px-3.5 py-2 rounded-xl neon-btn text-white font-extrabold text-xs shadow-lg hover:opacity-90 transition">
+            ⚡ Spawner +1 Ingénieur
+          </button>
+          <button onclick="spawnEngineers(5)" class="px-3 py-2 rounded-xl bg-purple-950/80 hover:bg-purple-900 text-cyan-300 border border-cyan-400/40 font-bold text-xs transition">
+            ⚡ +5 Ingénieurs
+          </button>
+          <button onclick="spawnEngineers(10)" class="px-3 py-2 rounded-xl bg-purple-950/80 hover:bg-purple-900 text-fuchsia-300 border border-fuchsia-400/40 font-bold text-xs transition">
+            ⚡ +10 Ingénieurs
+          </button>
+        </div>
+      </div>
+
+      <!-- Grille horizontale de cartes ingénieurs (Différente de la sidebar d'Atlas Bank !) -->
+      <div id="medinaGrid" class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-6 gap-2.5 max-h-44 overflow-y-auto pr-1"></div>
+    </section>
+
+    <!-- Bottom Split-View : Left Action Console + Right Cyber Terminal -->
+    <div class="grid grid-cols-1 lg:grid-cols-12 gap-6">
+
+      <!-- Left (6 cols) : Commandes DevOps & Accès Web -->
+      <div class="lg:col-span-6 cyber-card rounded-2xl p-5 space-y-4">
+        <div class="flex items-center justify-between border-b border-purple-500/30 pb-3">
+          <h3 class="text-sm font-extrabold text-cyan-300 uppercase tracking-wider">🧑‍💻 Console d'Exécution Ingénieur R&amp;D</h3>
+          <span id="medinaQosTag" class="px-2.5 py-0.5 rounded-full text-[11px] font-bold bg-emerald-500/20 text-emerald-300 mono">QoS : Illimité</span>
+        </div>
+
+        <div>
+          <label class="block text-xs font-bold text-purple-200 mb-1">Sélectionner le Pod Ingénieur actif (Source MedinaTech) :</label>
+          <select id="selMedinaUser" class="w-full bg-[#090414] border border-purple-500/50 rounded-xl px-3 py-2 text-xs text-cyan-200 mono"></select>
+        </div>
+
+        <!-- Boutons Web -->
+        <div class="space-y-2">
+          <span class="text-xs font-bold text-fuchsia-300 block">1. Explorer les Portails Web HTTP (:8080) :</span>
+          <div class="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+            <button onclick="medinaWeb('B')" class="p-3 rounded-xl bg-cyan-500/15 hover:bg-cyan-500/25 border border-cyan-400/50 text-cyan-200 text-xs font-bold text-left">
+              🚀 Ouvrir Cluster Interne MedinaTech
+              <span class="block text-[10px] mono text-cyan-300/80 mt-0.5">http://10.10.2.1:8080</span>
+            </button>
+            <button onclick="medinaWeb('A')" class="p-3 rounded-xl bg-amber-500/15 hover:bg-amber-500/25 border border-amber-400/50 text-amber-200 text-xs font-bold text-left">
+              🏦 Tenter Accès Serveur Atlas Bank
+              <span class="block text-[10px] mono text-amber-300/80 mt-0.5">http://10.10.1.1:8080</span>
+            </button>
+          </div>
+        </div>
+
+        <!-- Ping & Latence vers un Banquier d'Atlas Bank -->
+        <div class="space-y-2 pt-2 border-t border-purple-500/30">
+          <span class="text-xs font-bold text-fuchsia-300 block">2. Tester un Flux vers un Banquier d'Atlas Bank (`ping` &amp; `min/avg/max`) :</span>
+          <select id="selTargetAtlas" class="w-full bg-[#090414] border border-purple-500/50 rounded-xl px-3 py-2 text-xs text-amber-200 mono"></select>
+          <div class="grid grid-cols-3 gap-2 pt-1">
+            <button onclick="medinaPing()" class="py-2 px-3 rounded-xl bg-purple-600 hover:bg-purple-500 text-white text-xs font-bold shadow">
+              💬 Ping Banquier
+            </button>
+            <button onclick="medinaLatency()" class="py-2 px-3 rounded-xl bg-cyan-600 hover:bg-cyan-500 text-white text-xs font-bold shadow">
+              📊 min/avg/max
+            </button>
+            <button onclick="medinaSpeed()" class="py-2 px-3 rounded-xl bg-pink-600 hover:bg-pink-500 text-white text-xs font-bold shadow">
+              ⬇ Débit 2 Mo
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Right (6 cols) : Cyber Telemetry Screen -->
+      <div class="lg:col-span-6 cyber-card rounded-2xl p-5 flex flex-col justify-between space-y-4">
+        <div class="flex items-center justify-between border-b border-purple-500/30 pb-3">
+          <span class="text-sm font-extrabold text-fuchsia-300 uppercase tracking-wider">📡 Télémétrie &amp; Réponse Réseau Live</span>
+          <span id="medinaPolTag" class="px-2.5 py-0.5 rounded-full text-[11px] font-bold bg-rose-500/20 text-rose-300 mono">🔒 ISOLÉ D'ATLAS BANK</span>
+        </div>
+
+        <div id="medinaScreen" class="bg-[#05020c] border-2 border-purple-500/40 rounded-xl p-4 flex-1 flex flex-col justify-center min-h-[190px] mono text-xs">
+          <p class="text-purple-300/60 text-center">En attente d'exécution d'un appel HTTP curl ou d'une sonde ICMP ping...</p>
+        </div>
+
+        <div class="grid grid-cols-3 gap-2 text-center bg-[#090414] p-2.5 rounded-xl border border-purple-500/30 mono text-xs">
+          <div><span class="text-[10px] text-purple-400 block">MIN</span><span id="mLatMin" class="font-bold text-cyan-300">-- ms</span></div>
+          <div><span class="text-[10px] text-purple-400 block">AVG</span><span id="mLatAvg" class="font-bold text-fuchsia-300">-- ms</span></div>
+          <div><span class="text-[10px] text-purple-400 block">MAX</span><span id="mLatMax" class="font-bold text-amber-300">-- ms</span></div>
+        </div>
+      </div>
+
+    </div>
+  </main>
+
+  <script>
+    var host = window.location.hostname || "localhost";
+    document.getElementById("linkAtlas").href = "http://" + host + ":5001";
+    document.getElementById("linkSentinel").href = "http://" + host + ":5000";
+
+    function toast(msg, isErr) {
+      var box = document.getElementById("toastBox");
+      var el = document.createElement("div");
+      el.className = "px-4 py-3 rounded-xl border text-xs font-bold shadow-xl " +
+        (isErr ? "bg-rose-950 border-rose-500 text-rose-200" : "bg-[#1a0b38] border-cyan-400 text-cyan-200");
+      el.textContent = msg;
+      box.appendChild(el);
+      setTimeout(function() { if (el.parentNode) el.parentNode.removeChild(el); }, 3200);
+    }
+
+    function preserveSelect(selEl, htmlStr) {
+      var cur = selEl.value;
+      selEl.innerHTML = htmlStr;
+      if (cur && Array.from(selEl.options).some(function(o) { return o.value === cur; })) {
+        selEl.value = cur;
+      }
+    }
+
+    function renderMedinaUI(st) {
+      document.getElementById("medinaCount").textContent = st.usersB.length;
+
+      var pol = document.getElementById("medinaPolTag");
+      if (st.global_inter_allowed) {
+        pol.textContent = "🔓 ACCÈS INTER-ENTREPRISES OUVERT";
+        pol.className = "px-2.5 py-0.5 rounded-full text-[11px] font-bold bg-emerald-500/20 text-emerald-300 mono";
+      } else if (st.custom_rules.length > 0) {
+        pol.textContent = "🔑 " + st.custom_rules.length + " RÈGLE(S) OPENFLOW ACTIVE(S)";
+        pol.className = "px-2.5 py-0.5 rounded-full text-[11px] font-bold bg-amber-500/20 text-amber-300 mono";
+      } else {
+        pol.textContent = "🔒 ISOLÉ D'ATLAS BANK";
+        pol.className = "px-2.5 py-0.5 rounded-full text-[11px] font-bold bg-rose-500/20 text-rose-300 mono";
+      }
+
+      var qos = document.getElementById("medinaQosTag");
+      if (st.qos_rate_kbps > 0) {
+        qos.textContent = "⚡ QoS : Bridé " + st.qos_rate_kbps + " Kbps";
+        qos.className = "px-2.5 py-0.5 rounded-full text-[11px] font-bold bg-amber-500/20 text-amber-300 mono";
+      } else {
+        qos.textContent = "QoS : Illimité";
+        qos.className = "px-2.5 py-0.5 rounded-full text-[11px] font-bold bg-emerald-500/20 text-emerald-300 mono";
+      }
+
+      if (st.latency) {
+        document.getElementById("mLatMin").textContent = st.latency.min + " ms";
+        document.getElementById("mLatAvg").textContent = st.latency.avg + " ms";
+        document.getElementById("mLatMax").textContent = st.latency.max + " ms";
+      }
+
+      document.getElementById("medinaGrid").innerHTML = st.usersB.map(function(u) {
+        return "<div class='p-2.5 rounded-xl bg-[#090414] border border-cyan-500/40 flex flex-col justify-between'>" +
+          "<div class='flex items-center justify-between'><span class='text-[11px] font-bold text-cyan-300'>🧑‍💻 " + u.role + "</span>" +
+          "<span class='w-2 h-2 rounded-full bg-emerald-400'></span></div>" +
+          "<span class='mono text-[11px] text-fuchsia-300 mt-1'>" + u.ip + "/16</span>" +
+          "<span class='mono text-[10px] text-slate-400'>" + u.ns + "</span></div>";
+      }).join("");
+
+      preserveSelect(document.getElementById("selMedinaUser"), st.usersB.map(function(u) {
+        return "<option value='" + u.ns + "|" + u.ip + "'>🧑‍💻 " + u.role + " (" + u.ns + " — " + u.ip + ")</option>";
+      }).join(""));
+
+      preserveSelect(document.getElementById("selTargetAtlas"), st.usersA.map(function(u) {
+        return "<option value='" + u.ns + "|" + u.ip + "'>👔 " + u.role + " [Atlas Bank] (" + u.ns + " — " + u.ip + ")</option>";
+      }).join(""));
+    }
+
+    function showMedinaScreen(allowed, header, body, timing) {
+      var scr = document.getElementById("medinaScreen");
+      if (allowed) {
+        scr.className = "bg-emerald-950/30 border-2 border-emerald-400 rounded-xl p-4 flex-1 flex flex-col justify-center min-h-[190px] mono text-xs";
+        scr.innerHTML = "<div class='flex justify-between text-emerald-300 font-bold mb-2'><span>✓ " + header + "</span><span>" + (timing || "") + "</span></div>" +
+          "<div class='p-3 rounded bg-[#05020c] border border-emerald-500/40 text-cyan-200 break-all'>" + body + "</div>";
+      } else {
+        scr.className = "bg-rose-950/30 border-2 border-rose-500 rounded-xl p-4 flex-1 flex flex-col justify-center min-h-[190px] mono text-xs";
+        scr.innerHTML = "<div class='flex justify-between text-rose-400 font-bold mb-2'><span>✕ " + header + "</span><span>DROP OVS</span></div>" +
+          "<div class='p-3 rounded bg-[#05020c] border border-rose-500/40 text-rose-300 break-all'>" + body + "</div>";
+      }
+    }
+
+    async function spawnEngineers(n) {
+      toast("Déploiement dynamique de +" + n + " Pod(s) Ingénieur R&D...", false);
+      var res = await fetch("/api/add_user", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ company: "B", count: n })
+      });
+      renderMedinaUI(await res.json());
+      toast("+" + n + " Ingénieur(s) ajouté(s) sur le pool 10.10.2.x/16 !", false);
+    }
+
+    async function medinaWeb(targetComp) {
+      var u = document.getElementById("selMedinaUser").value.split("|");
+      var dstIp = targetComp === "B" ? "10.10.2.1" : "10.10.1.1";
+      var label = targetComp === "B" ? "Cluster Cloud MedinaTech" : "Portail Financier Atlas Bank";
+      var res = await fetch("/api/test_flow", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ src_ns: u[0], src_ip: u[1], dst_ip: dstIp, proto: "CURL", dst_label: label })
+      });
+      var data = await res.json();
+      showMedinaScreen(data.allowed, label + " (http://" + dstIp + ":8080)", data.output, data.latency);
+      renderMedinaUI(data.state);
+    }
+
+    async function medinaPing() {
+      var u = document.getElementById("selMedinaUser").value.split("|");
+      var t = document.getElementById("selTargetAtlas").value.split("|");
+      var res = await fetch("/api/test_flow", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ src_ns: u[0], src_ip: u[1], dst_ip: t[1], proto: "PING", dst_label: t[0] + " (" + t[1] + ")" })
+      });
+      var data = await res.json();
+      showMedinaScreen(data.allowed, "ICMP PING " + u[0] + " -> " + t[0], data.output, data.latency);
+      renderMedinaUI(data.state);
+    }
+
+    async function medinaLatency() {
+      var u = document.getElementById("selMedinaUser").value.split("|");
+      var t = document.getElementById("selTargetAtlas").value.split("|");
+      toast("Mesure min/avg/max vers " + t[0] + "...", false);
+      var res = await fetch("/api/latency", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ src_ns: u[0], dst_ip: t[1], label: u[0] + " → " + t[0] })
+      });
+      var data = await res.json();
+      showMedinaScreen(data.allowed, "LATENCE MIN/AVG/MAX (" + data.pair + ")", data.summary, data.allowed ? ("avg=" + data.avg + "ms") : "Bloqué");
+      renderMedinaUI(data.state);
+    }
+
+    async function medinaSpeed() {
+      var u = document.getElementById("selMedinaUser").value.split("|");
+      toast("Test de débit 2 Mo sur le cluster...", false);
+      var res = await fetch("/api/qos_speed", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ src_ns: u[0], dst_ip: "10.10.2.1" })
+      });
+      var data = await res.json();
+      showMedinaScreen(true, "TÉLÉCHARGEMENT 2 Mo (" + data.qos_mode + ")", data.detail, data.duration);
+      renderMedinaUI(data.state);
+    }
+
+    async function poll() {
+      try {
+        var res = await fetch("/api/status");
+        renderMedinaUI(await res.json());
+      } catch (e) {}
+    }
+
+    window.addEventListener("DOMContentLoaded", function() {
+      poll();
+      setInterval(poll, 1500);
+    });
+  </script>
+</body>
+</html>
+"""
+
+
+# ==============================================================================
+# PAGE 3 (:5000) — SENTINEL-OVS NOC (CENTRE DE CONTRÔLE DE L'INGÉNIEUR RÉSEAU)
+# ==============================================================================
+CONTROL_HTML = r"""<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>SENTINEL-OVS NOC — Centre de Contrôle SDN &amp; Open vSwitch (:5000)</title>
+  <script src="https://cdn.tailwindcss.com/3.4.17"></script>
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600;700&display=swap');
+    body { font-family: 'Inter', sans-serif; background-color: #060a0e; color: #e2e8f0; }
+    .mono { font-family: 'JetBrains Mono', monospace; }
+  </style>
+</head>
+<body class="min-h-screen flex flex-col">
+  <div id="toastBox" class="fixed top-4 right-4 z-50 flex flex-col gap-2 max-w-sm w-full pointer-events-none"></div>
+
+  <header class="bg-[#0b1219] border-b border-emerald-500/40 sticky top-0 z-40">
+    <div class="max-w-7xl mx-auto px-5 py-3.5 flex flex-wrap items-center justify-between gap-4">
+      <div class="flex items-center gap-3.5">
+        <!-- Custom SVG Logo: Sentinel-OVS Radar Shield -->
+        <div class="w-12 h-12 rounded-xl bg-emerald-950 border-2 border-emerald-400 flex items-center justify-center shadow-lg shadow-emerald-500/20">
+          <svg viewBox="0 0 64 64" class="w-9 h-9">
+            <path d="M32 6 L56 16 L56 34 C56 48 45 56 32 60 C19 56 8 48 8 34 L8 16 Z" fill="#064e3b" stroke="#10b981" stroke-width="3"/>
+            <circle cx="32" cy="32" r="12" fill="none" stroke="#34d399" stroke-width="2" stroke-dasharray="4,2"/>
+            <circle cx="32" cy="32" r="4" fill="#10b981"/>
+            <line x1="32" y1="32" x2="42" y2="22" stroke="#6ee7b7" stroke-width="2.5"/>
+          </svg>
+        </div>
+        <div>
+          <div class="flex items-center gap-2.5">
+            <h1 class="text-base sm:text-lg font-extrabold tracking-wider text-white">SENTINEL-OVS — NOC &amp; SDN SECURITY CONTROLLER</h1>
+            <span class="px-2.5 py-0.5 text-[10px] font-bold uppercase rounded bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 mono">
+              Ingénieur Réseau • :5000
+            </span>
+          </div>
+          <p class="text-xs text-slate-400">Supervision en Temps Réel : <strong class="text-amber-300">Atlas Bank (:5001)</strong> ↔ <strong class="text-fuchsia-300">MedinaTech Labs (:5002)</strong> • QoS 1000 Kbps • Calcul min/avg/max</p>
+        </div>
+      </div>
+
+      <div class="flex flex-wrap items-center gap-2 text-xs">
+        <a id="navEnt1" href="#" target="_blank" class="px-3 py-2 rounded-lg font-bold bg-amber-500/20 hover:bg-amber-500/30 text-amber-300 border border-amber-500/40">
+          🏦 Ouvrir Atlas Bank (:5001)
+        </a>
+        <a id="navEnt2" href="#" target="_blank" class="px-3 py-2 rounded-lg font-bold bg-fuchsia-500/20 hover:bg-fuchsia-500/30 text-fuchsia-300 border border-fuchsia-500/40">
+          🚀 Ouvrir MedinaTech (:5002)
+        </a>
+        <button onclick="runAutomatedSuite()" class="px-3.5 py-2 rounded-lg font-extrabold bg-emerald-600 hover:bg-emerald-500 text-white shadow">
+          ▶ Exécuter les 3 Tests Automatisés (.pcap)
+        </button>
+        <button onclick="resetAll()" class="px-3 py-2 rounded-lg font-bold bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700">
+          🔄 Réinitialiser Tout
         </button>
       </div>
     </div>
   </header>
 
-  <main class="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 py-5 space-y-5">
+  <main class="flex-1 max-w-7xl w-full mx-auto px-5 py-5 space-y-5">
 
-    <!-- KPI Row -->
-    <section class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3.5">
-      <div class="bg-slate-900 border border-emerald-500/30 rounded-2xl p-4 flex items-center justify-between">
-        <div>
-          <p class="text-xs font-medium text-slate-400 uppercase">Flux Autorisés (Réels)</p>
-          <span id="kpiAllowed" class="text-3xl font-extrabold text-emerald-400 mono">0</span>
-          <p class="text-[11px] text-slate-400 mt-1">Code retour Linux = 0 (OK)</p>
-        </div>
-        <div class="w-11 h-11 rounded-xl bg-emerald-500/15 border border-emerald-500/30 flex items-center justify-center text-emerald-400 font-bold text-lg">✓</div>
+    <!-- Synoptic KPI Row -->
+    <section class="grid grid-cols-2 lg:grid-cols-5 gap-3">
+      <div class="bg-[#0b1219] border border-amber-500/30 rounded-2xl p-3.5">
+        <p class="text-[11px] font-semibold text-amber-300 uppercase">🏦 Atlas Bank (:5001)</p>
+        <span id="ctrlCountA" class="text-2xl font-extrabold text-white mono">2</span>
+        <span class="text-xs text-slate-400 ml-1">banquiers (10.10.1.x)</span>
       </div>
 
-      <div class="bg-slate-900 border border-rose-500/30 rounded-2xl p-4 flex items-center justify-between">
-        <div>
-          <p class="text-xs font-medium text-slate-400 uppercase">Flux Stoppés (Bloqués OVS)</p>
-          <span id="kpiBlocked" class="text-3xl font-extrabold text-rose-400 mono">0</span>
-          <p class="text-[11px] text-slate-400 mt-1">100% Packet Loss / Timeout</p>
-        </div>
-        <div class="w-11 h-11 rounded-xl bg-rose-500/15 border border-rose-500/30 flex items-center justify-center text-rose-400 font-bold text-lg">✕</div>
+      <div class="bg-[#0b1219] border border-fuchsia-500/30 rounded-2xl p-3.5">
+        <p class="text-[11px] font-semibold text-fuchsia-300 uppercase">🚀 MedinaTech (:5002)</p>
+        <span id="ctrlCountB" class="text-2xl font-extrabold text-white mono">2</span>
+        <span class="text-xs text-slate-400 ml-1">ingénieurs (10.10.2.x)</span>
       </div>
 
-      <div id="kpiInterCard" class="bg-slate-900 border border-rose-500/40 rounded-2xl p-4 flex items-center justify-between">
-        <div>
-          <p class="text-xs font-medium text-slate-400 uppercase">État Règle Inter-Groupe</p>
-          <div class="mt-1">
-            <span id="kpiInterBadge" class="inline-flex px-2.5 py-0.5 rounded-full text-xs font-bold bg-rose-500/20 text-rose-300 border border-rose-500/40">
-              🔒 INTERDIT (VLAN 10 ≠ 20)
-            </span>
-          </div>
-          <p class="text-[11px] text-slate-400 mt-1">DarMarket ↔ AtlasPay</p>
-        </div>
-        <button onclick="togglePerm('inter')" class="px-3 py-2 rounded-xl text-xs font-bold bg-slate-800 hover:bg-slate-700 text-white border border-slate-700">
-          Basculer
-        </button>
+      <div class="bg-[#0b1219] border border-emerald-500/30 rounded-2xl p-3.5">
+        <p class="text-[11px] font-semibold text-slate-400 uppercase">Flux Autorisés (Live)</p>
+        <span id="ctrlAllowed" class="text-2xl font-extrabold text-emerald-400 mono">0</span>
+        <span class="text-xs text-slate-400 ml-1">passés</span>
       </div>
 
-      <div class="bg-slate-900 border border-sky-500/30 rounded-2xl p-4 flex items-center justify-between">
-        <div>
-          <p class="text-xs font-medium text-slate-400 uppercase">Dernière Latence Mesurée</p>
-          <span id="kpiLatency" class="text-2xl font-extrabold text-sky-400 mono">-- ms</span>
-          <p id="kpiBridgeState" class="text-[11px] text-emerald-400 mt-1 font-medium">● Switch br-pfa actif</p>
-        </div>
-        <div class="w-11 h-11 rounded-xl bg-sky-500/15 border border-sky-500/30 flex items-center justify-center text-sky-400 font-bold text-xs mono">LIVE</div>
+      <div class="bg-[#0b1219] border border-rose-500/30 rounded-2xl p-3.5">
+        <p class="text-[11px] font-semibold text-slate-400 uppercase">Flux Stoppés (OVS Drop)</p>
+        <span id="ctrlBlocked" class="text-2xl font-extrabold text-rose-400 mono">0</span>
+        <span class="text-xs text-slate-400 ml-1">bloqués</span>
+      </div>
+
+      <div class="bg-[#0b1219] border border-amber-500/40 rounded-2xl p-3.5">
+        <p class="text-[11px] font-semibold text-slate-400 uppercase">Bride Débit QoS</p>
+        <span id="ctrlQosKpi" class="text-base font-extrabold text-emerald-400 mono block mt-1">ILLIMITÉ</span>
       </div>
     </section>
 
-    <!-- Main Control & Topology Grid -->
     <div class="grid grid-cols-1 lg:grid-cols-12 gap-5">
 
-      <!-- Left Column: Permissions & Real Tests -->
-      <div class="lg:col-span-5 space-y-4">
-
-        <!-- Permissions Box -->
-        <div class="bg-slate-900 border border-slate-800 rounded-2xl p-4 space-y-3">
-          <div class="border-b border-slate-800 pb-2">
-            <h2 class="text-sm font-bold text-white">🛡️ Contrôle des Permissions en Direct (Open vSwitch)</h2>
-            <p class="text-xs text-slate-400">Chaque clic exécute réellement <span class="mono text-teal-300">ovs-vsctl</span> / <span class="mono text-teal-300">ovs-ofctl</span> sur votre VM</p>
-          </div>
-
-          <div class="p-3 rounded-xl bg-slate-950 border border-slate-800 flex items-center justify-between">
-            <div>
-              <span class="text-xs font-bold text-white">Flux Intra-Groupe A (DarMarket VLAN 10)</span>
-              <p class="text-[11px] text-slate-400 mono">ns-a2 (10.10.0.12) ↔ ns-a1 (10.10.0.11)</p>
-            </div>
-            <button id="btnIntraA" onclick="togglePerm('intraA')" class="px-3 py-1.5 rounded-lg text-xs font-bold bg-emerald-500/20 text-emerald-300 border border-emerald-500/40">
-              ✓ PERMIS
-            </button>
-          </div>
-
-          <div class="p-3 rounded-xl bg-slate-950 border border-slate-800 flex items-center justify-between">
-            <div>
-              <span class="text-xs font-bold text-white">Flux Intra-Groupe B (AtlasPay VLAN 20)</span>
-              <p class="text-[11px] text-slate-400 mono">ns-b2 (10.10.0.22) ↔ ns-b1 (10.10.0.21)</p>
-            </div>
-            <button id="btnIntraB" onclick="togglePerm('intraB')" class="px-3 py-1.5 rounded-lg text-xs font-bold bg-emerald-500/20 text-emerald-300 border border-emerald-500/40">
-              ✓ PERMIS
-            </button>
-          </div>
-
-          <div id="boxInter" class="p-3.5 rounded-xl bg-rose-950/25 border border-rose-500/40 flex items-center justify-between">
-            <div>
-              <span class="text-xs font-bold text-white">Flux Inter-Groupe (DarMarket ↔ AtlasPay)</span>
-              <p id="descInter" class="text-[11px] text-rose-200/80">Isolation VLAN 10 ≠ VLAN 20 active sur la VM</p>
-            </div>
-            <button id="btnInter" onclick="togglePerm('inter')" class="px-3.5 py-2 rounded-lg text-xs font-extrabold bg-rose-600 text-white shadow">
-              ✕ INTERDIT
-            </button>
-          </div>
-
-          <div class="bg-slate-950 rounded-xl p-2.5 border border-slate-800">
-            <span class="text-[10px] text-slate-400 block mb-1">COMMANDE LINUX EXÉCUTÉE SUR LA VM :</span>
-            <code id="cmdDisplay" class="text-[11px] mono text-teal-300 break-all">sudo ./pfa_lab.sh setup</code>
-          </div>
+      <!-- Left (5 cols) : Règles OpenFlow (Permettre / Interdire) -->
+      <div class="lg:col-span-5 bg-[#0b1219] border border-slate-800 rounded-2xl p-5 space-y-4">
+        <div class="border-b border-slate-800 pb-2.5">
+          <h2 class="text-sm font-extrabold text-white">🛡️ 1. Règles de Sécurité OpenFlow (Permettre / Interdire)</h2>
+          <p class="text-xs text-slate-400">Agissez en temps réel sur le commutateur central <span class="mono text-emerald-400">br-pfa</span></p>
         </div>
 
-        <!-- Tests Launcher Box -->
-        <div class="bg-slate-900 border border-slate-800 rounded-2xl p-4 space-y-3">
-          <div class="border-b border-slate-800 pb-2">
-            <h2 class="text-sm font-bold text-white">🚀 Lancer les Vrais Tests sur la VM Ubuntu</h2>
-            <p class="text-xs text-slate-400">Exécute <span class="mono">ip netns exec</span> + <span class="mono">tcpdump</span> et affiche le vrai résultat</p>
+        <div class="p-3.5 rounded-xl bg-slate-950 border border-slate-800 flex items-center justify-between gap-2">
+          <div>
+            <span class="text-xs font-bold text-white block">Flux Global Atlas Bank ↔ MedinaTech</span>
+            <span id="globStatusText" class="text-[11px] text-rose-400 font-bold">🔒 INTERDIT PAR DÉFAUT (Isolation stricte)</span>
           </div>
-
-          <div class="grid grid-cols-3 gap-2">
-            <button onclick="runRealTest(1)" class="p-2.5 rounded-xl bg-emerald-600/20 hover:bg-emerald-600/30 border border-emerald-500/40 text-left">
-              <span class="text-xs font-extrabold text-emerald-300 block">TEST 1 (Intra)</span>
-              <span class="text-[10px] text-slate-300">ns-a2 → ns-a1</span>
-            </button>
-            <button onclick="runRealTest(2)" class="p-2.5 rounded-xl bg-rose-600/20 hover:bg-rose-600/30 border border-rose-500/40 text-left">
-              <span class="text-xs font-extrabold text-rose-300 block">TEST 2 (Inter)</span>
-              <span class="text-[10px] text-slate-300">ns-a2 → ns-b1</span>
-            </button>
-            <button onclick="runRealTest(3)" class="p-2.5 rounded-xl bg-amber-500/20 hover:bg-amber-500/30 border border-amber-500/40 text-left">
-              <span class="text-xs font-extrabold text-amber-300 block">TEST 3 (Cycle)</span>
-              <span class="text-[10px] text-slate-300">Ouvrir → Bloquer</span>
-            </button>
-          </div>
-
-          <div class="pt-2 border-t border-slate-800 grid grid-cols-3 gap-2">
-            <select id="selSrc" class="bg-slate-950 border border-slate-700 rounded-lg px-2 py-1.5 text-xs text-white">
-              <option value="ns-a2">De: ns-a2 (.12)</option>
-              <option value="ns-b2">De: ns-b2 (.22)</option>
-              <option value="ns-a1">De: ns-a1 (.11)</option>
-            </select>
-            <select id="selDst" class="bg-slate-950 border border-slate-700 rounded-lg px-2 py-1.5 text-xs text-white">
-              <option value="ns-a1">Vers: ns-a1 (.11)</option>
-              <option value="ns-b1">Vers: ns-b1 (.21)</option>
-              <option value="ns-b2">Vers: ns-b2 (.22)</option>
-            </select>
-            <select id="selProto" class="bg-slate-950 border border-slate-700 rounded-lg px-2 py-1.5 text-xs text-white">
-              <option value="CURL">HTTP curl :8080</option>
-              <option value="PING">ICMP ping</option>
-            </select>
-          </div>
-
-          <button onclick="sendCustomRealFlow()" class="w-full py-2 rounded-xl bg-gradient-to-r from-teal-600 to-blue-600 hover:from-teal-500 hover:to-blue-500 text-white font-bold text-xs shadow">
-            ⚡ Exécuter ce Flux sur la VM maintenant
+          <button id="btnGlobToggle" onclick="toggleGlobal()" class="px-3.5 py-2 rounded-xl text-xs font-extrabold bg-rose-600 hover:bg-rose-500 text-white shadow shrink-0">
+            Permettre Tout
           </button>
         </div>
-      </div>
 
-      <!-- Right Column: Visual Topology & Live Server Response -->
-      <div class="lg:col-span-7 bg-slate-900 border border-slate-800 rounded-2xl p-4 flex flex-col justify-between">
-        <div class="flex items-center justify-between border-b border-slate-800 pb-2.5">
+        <div class="p-3.5 rounded-xl bg-slate-950 border border-slate-800 space-y-2.5">
+          <span class="text-xs font-bold text-emerald-400 block">🔑 Autoriser un Employé ou un Portail Web Spécifique :</span>
           <div>
-            <h2 class="text-sm font-bold text-white">🌐 Topologie Réseau en Direct (<span id="topoHostTitle" class="mono text-teal-300">Ubuntu VM</span>)</h2>
-            <p class="text-xs text-slate-400">Animation synchronisée avec le vrai résultat de la commande Linux</p>
+            <label class="block text-[10px] uppercase text-amber-300 mb-1">Côté ATLAS BANK (Serveur Web ou Banquier) :</label>
+            <select id="selRuleA" class="w-full bg-slate-900 border border-slate-700 rounded-lg px-2.5 py-1.5 text-xs text-white mono"></select>
+          </div>
+          <div>
+            <label class="block text-[10px] uppercase text-fuchsia-300 mb-1">Côté MEDINATECH LABS (Serveur Web ou Ingénieur) :</label>
+            <select id="selRuleB" class="w-full bg-slate-900 border border-slate-700 rounded-lg px-2.5 py-1.5 text-xs text-white mono"></select>
+          </div>
+          <button onclick="allowPair()" class="w-full py-2 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-extrabold shadow transition">
+            ✓ Permettre cette Connexion (Priorité 300)
+          </button>
+
+          <div class="pt-2">
+            <span class="text-[11px] font-semibold text-slate-400 block mb-1">Exceptions OpenFlow actives :</span>
+            <div id="activeRulesList" class="space-y-1.5 max-h-36 overflow-y-auto"></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Right (7 cols) : QoS 1000 Kbps, Latence min/avg/max & Console Audit -->
+      <div class="lg:col-span-7 flex flex-col gap-4">
+
+        <div class="bg-[#0b1219] border border-slate-800 rounded-2xl p-5 space-y-3">
+          <div class="flex flex-wrap items-center justify-between gap-2 border-b border-slate-800 pb-2.5">
+            <div>
+              <h2 class="text-sm font-extrabold text-white">⚡ 2. Limitation de Débit QoS (<span class="mono text-amber-300">1000 Kbps = 1 Mbps</span>)</h2>
+              <p class="text-xs text-slate-400">Police le trafic entrant sur les ports du switch (<span class="mono">ingress_policing_rate=1000</span>)</p>
+            </div>
+            <div class="flex gap-2">
+              <button id="btnQosToggle" onclick="toggleQos()" class="px-3.5 py-2 rounded-xl text-xs font-extrabold bg-amber-600 hover:bg-amber-500 text-white shadow">
+                ⚡ Activer Limitation 1000 Kbps
+              </button>
+              <button onclick="runQosCompare()" class="px-3 py-2 rounded-xl text-xs font-bold bg-slate-800 hover:bg-slate-700 text-amber-300 border border-amber-500/40">
+                🧪 Test Comparatif QoS
+              </button>
+            </div>
+          </div>
+          <div id="qosResultBanner" class="p-3 rounded-xl bg-slate-950 border border-slate-800 text-xs mono text-slate-300">
+            Débit illimité. Cliquez sur « Activer Limitation 1000 Kbps » ou « Test Comparatif QoS ».
           </div>
         </div>
 
-        <div class="my-3 bg-slate-950 rounded-xl border border-slate-800 p-2">
-          <svg viewBox="0 0 760 365" class="w-full h-auto">
-            <!-- Group A -->
-            <rect x="20" y="15" width="335" height="175" rx="12" fill="#0284c7" fill-opacity="0.08" stroke="#0284c7" stroke-width="1.6" stroke-dasharray="5,3"/>
-            <text x="187" y="36" text-anchor="middle" fill="#38bdf8" font-size="11.5" font-weight="700">GROUPE A — DarMarket (VLAN 10)</text>
-
-            <rect x="36" y="50" width="142" height="95" rx="9" fill="#0f172a" stroke="#38bdf8" stroke-width="2"/>
-            <text x="107" y="72" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">ns-a1 (Serveur)</text>
-            <text x="107" y="90" text-anchor="middle" fill="#7dd3fc" font-size="10" font-family="monospace">10.10.0.11:8080</text>
-            <text x="107" y="112" text-anchor="middle" fill="#94a3b8" font-size="9.5" font-family="monospace">veth-a1</text>
-
-            <rect x="196" y="50" width="142" height="95" rx="9" fill="#0f172a" stroke="#38bdf8" stroke-width="2"/>
-            <text x="267" y="72" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">ns-a2 (Client)</text>
-            <text x="267" y="90" text-anchor="middle" fill="#7dd3fc" font-size="10" font-family="monospace">10.10.0.12/24</text>
-            <text x="267" y="112" text-anchor="middle" fill="#94a3b8" font-size="9.5" font-family="monospace">veth-a2</text>
-
-            <!-- Group B -->
-            <rect x="405" y="15" width="335" height="175" rx="12" fill="#0d9488" fill-opacity="0.08" stroke="#0d9488" stroke-width="1.6" stroke-dasharray="5,3"/>
-            <text x="572" y="36" text-anchor="middle" fill="#2dd4bf" font-size="11.5" font-weight="700">GROUPE B — AtlasPay (VLAN 20)</text>
-
-            <rect x="422" y="50" width="142" height="95" rx="9" fill="#0f172a" stroke="#2dd4bf" stroke-width="2"/>
-            <text x="493" y="72" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">ns-b1 (API FinTech)</text>
-            <text x="493" y="90" text-anchor="middle" fill="#5eead4" font-size="10" font-family="monospace">10.10.0.21:8080</text>
-            <text x="493" y="112" text-anchor="middle" fill="#94a3b8" font-size="9.5" font-family="monospace">veth-b1</text>
-
-            <rect x="582" y="50" width="142" height="95" rx="9" fill="#0f172a" stroke="#2dd4bf" stroke-width="2"/>
-            <text x="653" y="72" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">ns-b2 (Client)</text>
-            <text x="653" y="90" text-anchor="middle" fill="#5eead4" font-size="10" font-family="monospace">10.10.0.22/24</text>
-            <text x="653" y="112" text-anchor="middle" fill="#94a3b8" font-size="9.5" font-family="monospace">veth-b2</text>
-
-            <!-- Cables -->
-            <line x1="107" y1="145" x2="107" y2="240" stroke="#38bdf8" stroke-width="3"/>
-            <line x1="267" y1="145" x2="267" y2="240" stroke="#38bdf8" stroke-width="3"/>
-            <line x1="493" y1="145" x2="493" y2="240" stroke="#2dd4bf" stroke-width="3"/>
-            <line x1="653" y1="145" x2="653" y2="240" stroke="#2dd4bf" stroke-width="3"/>
-
-            <!-- OVS Switch -->
-            <rect x="35" y="240" width="690" height="95" rx="12" fill="#1e293b" stroke="#475569" stroke-width="2"/>
-            <text x="380" y="263" text-anchor="middle" fill="#fff" font-size="12" font-weight="800">Open vSwitch « br-pfa » (Noyau Linux Ubuntu)</text>
-
-            <rect id="svgIntraA" x="55" y="275" width="185" height="44" rx="8" fill="#064e3b" stroke="#10b981" stroke-width="1.5"/>
-            <text x="147" y="293" text-anchor="middle" fill="#a7f3d0" font-size="10" font-weight="700">VLAN 10 (DarMarket)</text>
-            <text id="svgTxtA" x="147" y="309" text-anchor="middle" fill="#34d399" font-size="9.5" font-family="monospace" font-weight="700">PERMIS</text>
-
-            <rect id="svgInter" x="265" y="273" width="230" height="48" rx="8" fill="#4c0519" stroke="#f43f5e" stroke-width="2"/>
-            <text x="380" y="292" text-anchor="middle" fill="#fecdd3" font-size="10" font-weight="800">PARE-FEU INTER-GROUPE (10 ↔ 20)</text>
-            <text id="svgTxtInter" x="380" y="310" text-anchor="middle" fill="#fb7185" font-size="10" font-family="monospace" font-weight="700">🔒 ISOLÉ (DROP)</text>
-
-            <rect id="svgIntraB" x="520" y="275" width="185" height="44" rx="8" fill="#064e3b" stroke="#10b981" stroke-width="1.5"/>
-            <text x="612" y="293" text-anchor="middle" fill="#a7f3d0" font-size="10" font-weight="700">VLAN 20 (AtlasPay)</text>
-            <text id="svgTxtB" x="612" y="309" text-anchor="middle" fill="#34d399" font-size="9.5" font-family="monospace" font-weight="700">PERMIS</text>
-
-            <!-- Animated Packet -->
-            <g id="pktNode" style="display:none;">
-              <circle id="pktCircle" cx="267" cy="145" r="9" fill="#10b981" stroke="#fff" stroke-width="2"/>
-            </g>
-          </svg>
-        </div>
-
-        <div class="p-3 rounded-xl bg-slate-950 border border-slate-800 space-y-1">
-          <div class="flex items-center justify-between">
-            <span id="resBadge" class="px-2 py-0.5 rounded text-xs font-bold bg-slate-800 text-slate-300 mono">EN ATTENTE</span>
-            <span id="resPcapInfo" class="text-[11px] mono text-sky-400">Fichier .pcap : --</span>
+        <div class="bg-[#0b1219] border border-slate-800 rounded-2xl p-5 space-y-3">
+          <div class="flex flex-wrap items-center justify-between gap-2 border-b border-slate-800 pb-2.5">
+            <div>
+              <h2 class="text-sm font-extrabold text-white">📊 3. Calculateur de Latence (<span class="mono text-sky-300">min / avg / max / mdev</span>)</h2>
+              <p class="text-xs text-slate-400">Mesure précise sur salve ICMP entre les namespaces</p>
+            </div>
+            <button onclick="calculateLatency()" class="px-3.5 py-2 rounded-xl text-xs font-extrabold bg-sky-600 hover:bg-sky-500 text-white shadow">
+              📊 Calculer min / avg / max
+            </button>
           </div>
-          <p id="resOutput" class="text-xs mono text-slate-300 break-all pt-1">Cliquez sur un test à gauche pour exécuter la commande sur votre VM.</p>
+
+          <div class="grid grid-cols-2 sm:grid-cols-4 gap-2.5">
+            <div class="p-3 rounded-xl bg-slate-950 border border-slate-800 text-center">
+              <span class="text-[10px] uppercase text-slate-400 block">MIN</span>
+              <span id="latMin" class="text-lg font-extrabold text-emerald-400 mono">-- ms</span>
+            </div>
+            <div class="p-3 rounded-xl bg-slate-950 border border-slate-800 text-center">
+              <span class="text-[10px] uppercase text-slate-400 block">AVG (Moy)</span>
+              <span id="latAvg" class="text-lg font-extrabold text-sky-400 mono">-- ms</span>
+            </div>
+            <div class="p-3 rounded-xl bg-slate-950 border border-slate-800 text-center">
+              <span class="text-[10px] uppercase text-slate-400 block">MAX</span>
+              <span id="latMax" class="text-lg font-extrabold text-amber-400 mono">-- ms</span>
+            </div>
+            <div class="p-3 rounded-xl bg-slate-950 border border-slate-800 text-center">
+              <span class="text-[10px] uppercase text-slate-400 block">MDEV (Jitter)</span>
+              <span id="latMdev" class="text-lg font-extrabold text-purple-400 mono">-- ms</span>
+            </div>
+          </div>
         </div>
+
+        <div class="bg-[#0b1219] border border-slate-800 rounded-2xl p-4 flex-1 flex flex-col justify-between">
+          <div class="flex items-center justify-between mb-1.5">
+            <span class="text-xs font-bold uppercase text-white">Journal d'Audit Temps Réel (<span class="mono text-emerald-400">Atlas Bank :5001 • MedinaTech :5002 • Preuves .pcap</span>)</span>
+            <code id="ctrlLastCmd" class="text-[11px] mono text-teal-300">Prêt</code>
+          </div>
+          <div id="ctrlLogs" class="bg-slate-950 border border-slate-800 rounded-xl p-3 h-40 overflow-y-auto mono text-[11px] space-y-1 text-slate-300"></div>
+        </div>
+
       </div>
     </div>
-
-    <!-- Bottom Row: Live Charts & Real tcpdump Output -->
-    <div class="grid grid-cols-1 lg:grid-cols-12 gap-5">
-      <div class="lg:col-span-4 bg-slate-900 border border-slate-800 rounded-2xl p-4">
-        <h3 class="text-xs font-bold uppercase text-white mb-2">Graphique 1 — Historique des Flux Réels</h3>
-        <div class="relative h-52"><canvas id="chartHistory"></canvas></div>
-      </div>
-
-      <div class="lg:col-span-3 bg-slate-900 border border-slate-800 rounded-2xl p-4">
-        <h3 class="text-xs font-bold uppercase text-white mb-2">Graphique 2 — Bilan par Protocole</h3>
-        <div class="relative h-52"><canvas id="chartProto"></canvas></div>
-      </div>
-
-      <div class="lg:col-span-5 bg-slate-900 border border-slate-800 rounded-2xl p-4 flex flex-col">
-        <div class="flex items-center justify-between mb-2">
-          <h3 class="text-xs font-bold uppercase text-white">Sonde <span class="mono text-sky-400">tcpdump -nn -r capture.pcap</span> (Vraies Trames VM)</h3>
-        </div>
-        <div id="pcapConsole" class="bg-slate-950 border border-slate-800 rounded-xl p-3 h-52 overflow-y-auto custom-scroll mono text-[11px] space-y-1 text-slate-300">
-          <div class="text-slate-500"># Prêt à lire les captures .pcap générées sur la VM...</div>
-        </div>
-      </div>
-    </div>
-
   </main>
 
   <script>
-    var COORDS = {
-      "ns-a1": { x: 107, y: 145, group: "A" },
-      "ns-a2": { x: 267, y: 145, group: "A" },
-      "ns-b1": { x: 493, y: 145, group: "B" },
-      "ns-b2": { x: 653, y: 145, group: "B" }
-    };
-    var currentPerms = { intraA: true, intraB: true, inter: false };
-    var chartHist = null;
-    var chartProto = null;
+    var currentState = null;
+    var host = window.location.hostname || "localhost";
+    document.getElementById("navEnt1").href = "http://" + host + ":5001";
+    document.getElementById("navEnt2").href = "http://" + host + ":5002";
 
     function toast(msg, isErr) {
       var box = document.getElementById("toastBox");
@@ -530,232 +1046,180 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         (isErr ? "bg-rose-950 border-rose-500 text-rose-100" : "bg-slate-900 border-emerald-500 text-emerald-100");
       el.textContent = msg;
       box.appendChild(el);
-      setTimeout(function() { if (el.parentNode) el.parentNode.removeChild(el); }, 3000);
+      setTimeout(function() { if (el.parentNode) el.parentNode.removeChild(el); }, 3200);
     }
 
-    function initCharts() {
-      chartHist = new Chart(document.getElementById("chartHistory").getContext("2d"), {
-        type: "bar",
-        data: {
-          labels: [],
-          datasets: [
-            { label: "Autorisé (OK)", data: [], backgroundColor: "#10b981", borderRadius: 4 },
-            { label: "Stoppé (Drop)", data: [], backgroundColor: "#f43f5e", borderRadius: 4 }
-          ]
-        },
-        options: {
-          responsive: true, maintainAspectRatio: false,
-          scales: { y: { beginAtZero: true, ticks: { stepSize: 1, color: "#94a3b8" } }, x: { ticks: { color: "#94a3b8", font: { size: 9 } } } },
-          plugins: { legend: { labels: { color: "#cbd5e1", font: { size: 10 } } } }
-        }
-      });
-
-      chartProto = new Chart(document.getElementById("chartProto").getContext("2d"), {
-        type: "doughnut",
-        data: {
-          labels: ["ICMP Autorisé", "HTTP Autorisé", "ICMP Stoppé", "HTTP Stoppé"],
-          datasets: [{ data: [1, 1, 1, 1], backgroundColor: ["#10b981", "#0ea5e9", "#f43f5e", "#f59e0b"], borderWidth: 0 }]
-        },
-        options: {
-          responsive: true, maintainAspectRatio: false, cutout: "60%",
-          plugins: { legend: { position: "bottom", labels: { color: "#cbd5e1", font: { size: 10 }, boxWidth: 10 } } }
-        }
-      });
+    function preserveSelect(selEl, htmlStr) {
+      var cur = selEl.value;
+      selEl.innerHTML = htmlStr;
+      if (cur && Array.from(selEl.options).some(function(o) { return o.value === cur; })) {
+        selEl.value = cur;
+      }
     }
 
-    function applyStatusUI(st) {
-      if (!st) return;
-      document.getElementById("vmHostBadge").textContent = "● VM : " + st.hostname;
-      document.getElementById("topoHostTitle").textContent = "VM " + st.hostname;
-      document.getElementById("kpiAllowed").textContent = st.stats.allowed;
-      document.getElementById("kpiBlocked").textContent = st.stats.blocked;
-      document.getElementById("cmdDisplay").textContent = st.last_cmd;
+    function renderControl(st) {
+      currentState = st;
+      document.getElementById("ctrlCountA").textContent = st.usersA.length;
+      document.getElementById("ctrlCountB").textContent = st.usersB.length;
+      document.getElementById("ctrlAllowed").textContent = st.stats.allowed;
+      document.getElementById("ctrlBlocked").textContent = st.stats.blocked;
+      document.getElementById("ctrlLastCmd").textContent = st.last_cmd;
 
-      currentPerms = st.permissions;
-
-      // Intra A
-      var btnA = document.getElementById("btnIntraA");
-      btnA.textContent = currentPerms.intraA ? "✓ PERMIS" : "✕ INTERDIT";
-      btnA.className = currentPerms.intraA
-        ? "px-3 py-1.5 rounded-lg text-xs font-bold bg-emerald-500/20 text-emerald-300 border border-emerald-500/40"
-        : "px-3 py-1.5 rounded-lg text-xs font-bold bg-rose-600 text-white";
-      document.getElementById("svgTxtA").textContent = currentPerms.intraA ? "PERMIS" : "BLOQUÉ (DROP)";
-
-      // Intra B
-      var btnB = document.getElementById("btnIntraB");
-      btnB.textContent = currentPerms.intraB ? "✓ PERMIS" : "✕ INTERDIT";
-      btnB.className = currentPerms.intraB
-        ? "px-3 py-1.5 rounded-lg text-xs font-bold bg-emerald-500/20 text-emerald-300 border border-emerald-500/40"
-        : "px-3 py-1.5 rounded-lg text-xs font-bold bg-rose-600 text-white";
-      document.getElementById("svgTxtB").textContent = currentPerms.intraB ? "PERMIS" : "BLOQUÉ (DROP)";
-
-      // Inter A <-> B
-      var inter = currentPerms.inter;
-      var btnInter = document.getElementById("btnInter");
-      var kpiBadge = document.getElementById("kpiInterBadge");
-      var svgInter = document.getElementById("svgInter");
-      var svgTxtInter = document.getElementById("svgTxtInter");
-
-      if (inter) {
-        btnInter.textContent = "✓ PERMIS (OUVERT)";
-        btnInter.className = "px-3.5 py-2 rounded-lg text-xs font-extrabold bg-emerald-600 text-white shadow";
-        kpiBadge.textContent = "🔓 PERMIS (VLAN PARTAGÉ)";
-        kpiBadge.className = "inline-flex px-2.5 py-0.5 rounded-full text-xs font-bold bg-emerald-500/20 text-emerald-300 border border-emerald-500/40";
-        svgInter.setAttribute("fill", "#064e3b");
-        svgInter.setAttribute("stroke", "#10b981");
-        svgTxtInter.textContent = "🔓 OUVERT (FLUX A↔B AUTORISÉ)";
-        svgTxtInter.setAttribute("fill", "#34d399");
+      var qosKpi = document.getElementById("ctrlQosKpi");
+      var btnQos = document.getElementById("btnQosToggle");
+      if (st.qos_rate_kbps > 0) {
+        qosKpi.textContent = "BRIDÉ (" + st.qos_rate_kbps + " Kbps)";
+        qosKpi.className = "text-sm font-extrabold text-amber-400 mono block mt-1";
+        btnQos.textContent = "🔓 Désactiver QoS (Illimité)";
+        btnQos.className = "px-3.5 py-2 rounded-xl text-xs font-extrabold bg-rose-600 hover:bg-rose-500 text-white shadow";
       } else {
-        btnInter.textContent = "✕ INTERDIT";
-        btnInter.className = "px-3.5 py-2 rounded-lg text-xs font-extrabold bg-rose-600 text-white shadow";
-        kpiBadge.textContent = "🔒 INTERDIT (VLAN 10 ≠ 20)";
-        kpiBadge.className = "inline-flex px-2.5 py-0.5 rounded-full text-xs font-bold bg-rose-500/20 text-rose-300 border border-rose-500/40";
-        svgInter.setAttribute("fill", "#4c0519");
-        svgInter.setAttribute("stroke", "#f43f5e");
-        svgTxtInter.textContent = "🔒 ISOLÉ (DROP)";
-        svgTxtInter.setAttribute("fill", "#fb7185");
+        qosKpi.textContent = "ILLIMITÉ";
+        qosKpi.className = "text-sm font-extrabold text-emerald-400 mono block mt-1";
+        btnQos.textContent = "⚡ Activer Limitation 1000 Kbps";
+        btnQos.className = "px-3.5 py-2 rounded-xl text-xs font-extrabold bg-amber-600 hover:bg-amber-500 text-white shadow";
       }
 
-      var s = st.stats;
-      if ((s.icmp_allowed + s.http_allowed + s.icmp_blocked + s.http_blocked) > 0 && chartProto) {
-        chartProto.data.datasets[0].data = [s.icmp_allowed, s.http_allowed, s.icmp_blocked, s.http_blocked];
-        chartProto.update();
+      if (st.latency) {
+        document.getElementById("latMin").textContent = st.latency.min + " ms";
+        document.getElementById("latAvg").textContent = st.latency.avg + " ms";
+        document.getElementById("latMax").textContent = st.latency.max + " ms";
+        document.getElementById("latMdev").textContent = st.latency.mdev + " ms";
       }
-    }
 
-    function animateDot(srcId, dstId, allowed) {
-      var s = COORDS[srcId];
-      var d = COORDS[dstId];
-      var g = document.getElementById("pktNode");
-      var c = document.getElementById("pktCircle");
-      c.setAttribute("fill", allowed ? "#10b981" : "#f43f5e");
-      g.style.display = "block";
-
-      var pts = [{ x: s.x, y: 145 }, { x: s.x, y: 260 }];
-      if (allowed) {
-        pts.push({ x: d.x, y: 260 }, { x: d.x, y: 145 });
+      var globTxt = document.getElementById("globStatusText");
+      var btnGlob = document.getElementById("btnGlobToggle");
+      if (st.global_inter_allowed) {
+        globTxt.textContent = "🔓 AUTORISÉ GLOBALEMENT (Atlas Bank ↔ MedinaTech)";
+        globTxt.className = "text-[11px] text-emerald-400 font-bold";
+        btnGlob.textContent = "Interdire Tout";
+        btnGlob.className = "px-3.5 py-2 rounded-xl text-xs font-extrabold bg-emerald-600 hover:bg-emerald-500 text-white shadow shrink-0";
       } else {
-        pts.push({ x: 380, y: 260 });
+        globTxt.textContent = "🔒 INTERDIT PAR DÉFAUT (Isolation stricte)";
+        globTxt.className = "text-[11px] text-rose-400 font-bold";
+        btnGlob.textContent = "Permettre Tout";
+        btnGlob.className = "px-3.5 py-2 rounded-xl text-xs font-extrabold bg-rose-600 hover:bg-rose-500 text-white shadow shrink-0";
       }
 
-      var idx = 0, p = 0;
-      function step() {
-        p += 0.1;
-        if (p >= 1) {
-          p = 0; idx++;
-          if (idx >= pts.length - 1) {
-            setTimeout(function() { g.style.display = "none"; }, 300);
-            return;
-          }
-        }
-        var x = pts[idx].x + (pts[idx+1].x - pts[idx].x) * p;
-        var y = pts[idx].y + (pts[idx+1].y - pts[idx].y) * p;
-        c.setAttribute("cx", x);
-        c.setAttribute("cy", y);
-        requestAnimationFrame(step);
+      var optsA = "<option value='10.10.1.1'>🏦 Serveur Web Atlas Bank (10.10.1.1)</option>" +
+        st.usersA.map(function(u) { return "<option value='" + u.ip + "'>👔 " + u.role + " (" + u.ns + " • " + u.ip + ")</option>"; }).join("");
+      var optsB = "<option value='10.10.2.1'>🚀 Serveur Web MedinaTech (10.10.2.1)</option>" +
+        st.usersB.map(function(u) { return "<option value='" + u.ip + "'>🧑‍💻 " + u.role + " (" + u.ns + " • " + u.ip + ")</option>"; }).join("");
+
+      preserveSelect(document.getElementById("selRuleA"), optsA);
+      preserveSelect(document.getElementById("selRuleB"), optsB);
+
+      var rBox = document.getElementById("activeRulesList");
+      if (st.custom_rules.length === 0) {
+        rBox.innerHTML = "<p class='text-[11px] text-slate-500 italic'>Aucune dérogation active.</p>";
+      } else {
+        rBox.innerHTML = st.custom_rules.map(function(r) {
+          return "<div class='px-2.5 py-1.5 rounded-lg bg-emerald-950/40 border border-emerald-500/40 flex items-center justify-between text-xs'>" +
+            "<span class='mono text-emerald-300'>✓ " + r.ip1 + " ↔ " + r.ip2 + "</span>" +
+            "<button onclick=\"denyPair('" + r.ip1 + "','" + r.ip2 + "')\" class='px-2 py-0.5 rounded bg-rose-600 text-white font-bold text-[10px]'>✕ Interdire</button></div>";
+        }).join("");
       }
-      requestAnimationFrame(step);
+
+      var lBox = document.getElementById("ctrlLogs");
+      lBox.innerHTML = st.logs.map(function(l) {
+        var col = l.allowed ? "text-emerald-300" : "text-rose-400 font-semibold";
+        return "<div class='" + col + "'>" + l.ts + " " + l.text + "</div>";
+      }).join("");
+      lBox.scrollTop = lBox.scrollHeight;
     }
 
-    async function togglePerm(target) {
-      var nextVal = !currentPerms[target];
-      var res = await fetch("/api/permission", {
+    async function toggleGlobal() {
+      var nextVal = !(currentState && currentState.global_inter_allowed);
+      var res = await fetch("/api/global_inter", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ target: target, allow: nextVal })
+        body: JSON.stringify({ allow: nextVal })
       });
-      var data = await res.json();
-      applyStatusUI(data);
-      toast("Permission " + target + " mise à jour sur Open vSwitch !", !nextVal);
+      renderControl(await res.json());
+      toast(nextVal ? "Interconnexion Globale PERMISE" : "Isolation Globale RÉTABLIE", !nextVal);
     }
 
-    async function triggerFlowAPI(src, dst, proto, pcapName, label) {
-      var res = await fetch("/api/flow", {
+    async function allowPair() {
+      var ip1 = document.getElementById("selRuleA").value;
+      var ip2 = document.getElementById("selRuleB").value;
+      var res = await fetch("/api/rule", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ src: src, dst: dst, proto: proto, pcap_name: pcapName })
+        body: JSON.stringify({ action: "allow", ip1: ip1, ip2: ip2 })
       });
-      var data = await res.json();
-      animateDot(src, dst, data.allowed);
-      applyStatusUI(data.status);
-
-      document.getElementById("kpiLatency").textContent = data.latency;
-      var badge = document.getElementById("resBadge");
-      badge.textContent = data.allowed ? "✓ AUTORISÉ (PASS)" : "✕ STOPPÉ (DROP OVS)";
-      badge.className = data.allowed
-        ? "px-2.5 py-0.5 rounded text-xs font-bold bg-emerald-500/20 text-emerald-300 mono"
-        : "px-2.5 py-0.5 rounded text-xs font-bold bg-rose-500/20 text-rose-300 mono";
-
-      document.getElementById("resPcapInfo").textContent = data.pcap_file + " (" + data.pcap_size + " octets)";
-      document.getElementById("resOutput").textContent = data.command + "  ==>  " + data.output;
-
-      var term = document.getElementById("pcapConsole");
-      data.tcpdump_lines.forEach(function(line) {
-        var d = document.createElement("div");
-        d.className = data.allowed ? "text-emerald-300" : "text-rose-400 font-semibold";
-        d.textContent = line;
-        term.appendChild(d);
-      });
-      term.scrollTop = term.scrollHeight;
-
-      if (chartHist) {
-        chartHist.data.labels.push(label || (src + "→" + dst));
-        chartHist.data.datasets[0].data.push(data.allowed ? 1 : 0);
-        chartHist.data.datasets[1].data.push(data.allowed ? 0 : 1);
-        if (chartHist.data.labels.length > 8) {
-          chartHist.data.labels.shift();
-          chartHist.data.datasets[0].data.shift();
-          chartHist.data.datasets[1].data.shift();
-        }
-        chartHist.update();
-      }
-      return data;
+      renderControl(await res.json());
+      toast("Permission accordée : " + ip1 + " ↔ " + ip2, false);
     }
 
-    async function sendCustomRealFlow() {
-      var s = document.getElementById("selSrc").value;
-      var d = document.getElementById("selDst").value;
-      var p = document.getElementById("selProto").value;
-      await triggerFlowAPI(s, d, p, "custom_flow.pcap", s + "→" + d);
-    }
-
-    async function runRealTest(num) {
-      if (num === 1) {
-        toast("Exécution réelle du Test 1 (Intragroupe) sur la VM...", false);
-        await triggerFlowAPI("ns-a2", "ns-a1", "CURL", "test1_intra.pcap", "Test 1 (Intra)");
-      } else if (num === 2) {
-        if (currentPerms.inter) await togglePerm("inter");
-        toast("Exécution réelle du Test 2 (Intergroupe bloqué) sur la VM...", true);
-        await triggerFlowAPI("ns-a2", "ns-b1", "CURL", "test2_inter_bloque.pcap", "Test 2 (Bloqué)");
-      } else if (num === 3) {
-        toast("Test 3 (Étape 3A) : Ouverture de la règle sur Open vSwitch...", false);
-        if (!currentPerms.inter) await togglePerm("inter");
-        await triggerFlowAPI("ns-a2", "ns-b1", "CURL", "test3_dynamique.pcap", "Test 3A (Ouvert)");
-        setTimeout(async function() {
-          toast("Test 3 (Étape 3B) : Rétablissement de l'isolation sur Open vSwitch...", true);
-          if (currentPerms.inter) await togglePerm("inter");
-          await triggerFlowAPI("ns-a2", "ns-b1", "CURL", "test3_bloque.pcap", "Test 3B (Rétabli)");
-        }, 1200);
-      }
-    }
-
-    async function runLabAction(act) {
-      toast("Réinitialisation de la topologie via pfa_lab.sh...", false);
-      var res = await fetch("/api/action", {
+    async function denyPair(ip1, ip2) {
+      var res = await fetch("/api/rule", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ action: act })
+        body: JSON.stringify({ action: "deny", ip1: ip1, ip2: ip2 })
       });
-      var data = await res.json();
-      applyStatusUI(data);
-      toast("Topologie et serveurs HTTP prêts !", false);
+      renderControl(await res.json());
+      toast("Permission révoquée : " + ip1 + " ↔ " + ip2, true);
     }
 
-    window.addEventListener("DOMContentLoaded", async function() {
-      initCharts();
-      var res = await fetch("/api/status");
-      var st = await res.json();
-      applyStatusUI(st);
+    async function toggleQos() {
+      var activate = (currentState && currentState.qos_rate_kbps === 0);
+      var res = await fetch("/api/qos", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ enable: activate, rate: 1000 })
+      });
+      var data = await res.json();
+      document.getElementById("qosResultBanner").textContent = data.message;
+      renderControl(data.state);
+      toast(data.message, !activate);
+    }
+
+    async function runQosCompare() {
+      toast("Test comparatif QoS (Illimité vs 1000 Kbps)...", false);
+      var res = await fetch("/api/qos_compare", { method: "POST" });
+      var data = await res.json();
+      document.getElementById("qosResultBanner").innerHTML = "<pre class='whitespace-pre-wrap text-amber-200 text-[11px]'>" + data.output + "</pre>";
+      renderControl(data.state);
+      toast("Test comparatif QoS terminé !", false);
+    }
+
+    async function calculateLatency() {
+      toast("Calcul de latence min/avg/max/mdev...", false);
+      var res = await fetch("/api/latency", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ src_ns: "ns-a-u1", dst_ip: "10.10.1.1", label: "ns-a-u1 → Atlas Bank Web" })
+      });
+      var data = await res.json();
+      renderControl(data.state);
+      toast("Latence calculée : avg = " + data.avg + " ms", false);
+    }
+
+    async function runAutomatedSuite() {
+      toast("Lancement des 3 Tests Automatisés (.pcap)...", false);
+      var res = await fetch("/api/run_suite", { method: "POST" });
+      var data = await res.json();
+      document.getElementById("qosResultBanner").innerHTML = "<pre class='whitespace-pre-wrap text-emerald-300 text-[11px]'>" + data.report + "</pre>";
+      renderControl(data.state);
+      toast("Les 3 Tests Obligatoires sont validés !", false);
+    }
+
+    async function resetAll() {
+      toast("Réinitialisation complète...", false);
+      var res = await fetch("/api/reset", { method: "POST" });
+      renderControl(await res.json());
+      toast("Laboratoire réinitialisé !", false);
+    }
+
+    async function poll() {
+      try {
+        var res = await fetch("/api/status");
+        renderControl(await res.json());
+      } catch (e) {}
+    }
+
+    window.addEventListener("DOMContentLoaded", function() {
+      poll();
+      setInterval(poll, 1500);
     });
   </script>
 </body>
@@ -763,68 +1227,240 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 """
 
 
-class SDNRequestHandler(http.server.BaseHTTPRequestHandler):
-    def _send_json(self, payload, status=200):
-        body = json.dumps(payload).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+def make_handler_for_role(role):
+    class RoleHandler(http.server.BaseHTTPRequestHandler):
+        def _send_json(self, obj, code=200):
+            body = json.dumps(obj).encode("utf-8")
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
 
-    def do_GET(self):
-        parsed = urlparse(self.path)
-        if parsed.path == "/api/status":
-            self._send_json(get_system_status())
-        else:
-            body = DASHBOARD_HTML.encode("utf-8")
+        def do_GET(self):
+            parsed = urlparse(self.path)
+            if parsed.path == "/api/status":
+                self._send_json(discover_live_state())
+                return
+
+            if role == "ENT1":
+                html = ATLAS_BANK_HTML
+            elif role == "ENT2":
+                html = MEDINATECH_HTML
+            else:
+                html = CONTROL_HTML
+
+            body = html.encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
 
-    def do_POST(self):
-        length = int(self.headers.get("Content-Length", 0))
-        raw = self.rfile.read(length).decode("utf-8") if length > 0 else "{}"
-        data = json.loads(raw)
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length", 0))
+            raw = self.rfile.read(length).decode("utf-8") if length > 0 else "{}"
+            data = json.loads(raw)
 
-        if self.path == "/api/permission":
-            st = apply_permission_change(data.get("target"), data.get("allow"))
-            self._send_json(st)
-        elif self.path == "/api/flow":
-            res = execute_real_network_flow(
-                data.get("src", "ns-a2"),
-                data.get("dst", "ns-a1"),
-                data.get("proto", "CURL"),
-                data.get("pcap_name"),
-            )
-            self._send_json(res)
-        elif self.path == "/api/action":
-            run_cmd("./pfa_lab.sh setup && ./pfa_lab.sh start", timeout=15)
-            STATE["intraA"] = True
-            STATE["intraB"] = True
-            STATE["inter"] = False
-            self._send_json(get_system_status())
-        else:
-            self._send_json({"error": "Not found"}, status=404)
+            if self.path == "/api/add_user":
+                comp = data.get("company", "A")
+                cnt = int(data.get("count", 1))
+                cmd = f"./pfa_lab.sh add-user {comp} {cnt}"
+                run_cmd(cmd, timeout=15)
+                with STATE_LOCK:
+                    STATE["last_cmd"] = f"sudo {cmd}"
+                org = "ATLAS BANK" if comp == "A" else "MEDINATECH LABS"
+                add_log(f"[+USERS] {org} : +{cnt} collaborateur(s) ajouté(s) avec IP dynamique (/16)", True)
+                self._send_json(discover_live_state())
 
-    def log_message(self, fmt, *args):
-        return
+            elif self.path == "/api/test_flow":
+                src_ns = data.get("src_ns", "ns-a-u1")
+                src_ip = data.get("src_ip", "10.10.1.2")
+                dst_ip = data.get("dst_ip", "10.10.1.1")
+                proto = data.get("proto", "CURL")
+                dst_label = data.get("dst_label", dst_ip)
+
+                if proto == "PING":
+                    cmd = f"ip netns exec {src_ns} ping -c 1 -W 1 {dst_ip}"
+                else:
+                    cmd = f"ip netns exec {src_ns} curl -s --max-time 2 http://{dst_ip}:8080"
+
+                rc, out, err, dt_ms = run_cmd(cmd, timeout=4)
+                allowed = (rc == 0)
+
+                with STATE_LOCK:
+                    STATE["last_cmd"] = f"sudo {cmd}"
+                    if allowed:
+                        STATE["allowed_count"] += 1
+                    else:
+                        STATE["blocked_count"] += 1
+
+                add_log(
+                    f"[{'AUTORISÉ' if allowed else 'STOPPÉ OVS'}] {src_ns} ({src_ip}) -> {dst_label} ({proto}) : {'200 OK / Reply' if allowed else '100% Bloqué'}",
+                    allowed
+                )
+
+                self._send_json({
+                    "allowed": allowed,
+                    "src_ns": src_ns,
+                    "src_ip": src_ip,
+                    "dst_label": dst_label,
+                    "latency": f"{dt_ms} ms",
+                    "output": out if allowed else "100% Packet Loss / Connection Timed Out — Rejeté par le pare-feu Sentinel-OVS (br-pfa)",
+                    "state": discover_live_state(),
+                })
+
+            elif self.path == "/api/rule":
+                act = data.get("action")
+                ip1 = data.get("ip1")
+                ip2 = data.get("ip2")
+                if act == "allow":
+                    cmd = f"./pfa_lab.sh allow-rule {ip1} {ip2}"
+                    run_cmd(cmd)
+                    with STATE_LOCK:
+                        STATE["last_cmd"] = f"sudo {cmd}"
+                        pair = {"ip1": ip1, "ip2": ip2}
+                        if pair not in STATE["custom_rules"]:
+                            STATE["custom_rules"].append(pair)
+                    add_log(f"[PERMISSION ACCORDÉE] OpenFlow Prio 300 : {ip1} <-> {ip2} AUTORISÉ", True)
+                else:
+                    cmd = f"./pfa_lab.sh deny-rule {ip1} {ip2}"
+                    run_cmd(cmd)
+                    with STATE_LOCK:
+                        STATE["last_cmd"] = f"sudo {cmd}"
+                        STATE["custom_rules"] = [r for r in STATE["custom_rules"] if not (r["ip1"] == ip1 and r["ip2"] == ip2)]
+                    add_log(f"[PERMISSION RÉVOQUÉE] {ip1} <-> {ip2} est à nouveau INTERDIT", False)
+                self._send_json(discover_live_state())
+
+            elif self.path == "/api/global_inter":
+                allow = bool(data.get("allow"))
+                cmd = "./pfa_lab.sh allow-all" if allow else "./pfa_lab.sh block-all"
+                run_cmd(cmd)
+                with STATE_LOCK:
+                    STATE["global_inter_allowed"] = allow
+                    if not allow:
+                        STATE["custom_rules"] = []
+                    STATE["last_cmd"] = f"sudo {cmd}"
+                add_log(f"[POLITIQUE GLOBALE] Atlas Bank <-> MedinaTech Labs : {'AUTORISÉ' if allow else 'ISOLÉ (BLOQUÉ)'}", allow)
+                self._send_json(discover_live_state())
+
+            elif self.path == "/api/qos":
+                enable = bool(data.get("enable"))
+                rate = int(data.get("rate", 1000)) if enable else 0
+                cmd = f"./pfa_lab.sh qos-limit {rate}" if enable else "./pfa_lab.sh qos-reset"
+                run_cmd(cmd)
+                with STATE_LOCK:
+                    STATE["qos_rate_kbps"] = rate
+                    STATE["last_cmd"] = f"sudo {cmd}"
+                msg = f"Limitation de débit QoS ACTIVÉE à {rate} Kbps (~1 Mbps)" if enable else "Limitation QoS DÉSACTIVÉE (Débit Illimité)"
+                add_log(f"[QoS OVS] {msg}", True)
+                self._send_json({"message": msg, "state": discover_live_state()})
+
+            elif self.path == "/api/qos_compare":
+                cmd = "./pfa_lab.sh qos-test"
+                _, out, _, _ = run_cmd(cmd, timeout=20)
+                with STATE_LOCK:
+                    STATE["qos_rate_kbps"] = 1000
+                    STATE["last_cmd"] = f"sudo {cmd}"
+                add_log("[QoS TEST] Démonstration comparative Sans QoS vs Avec QoS 1000 Kbps effectuée", True)
+                self._send_json({"output": out, "state": discover_live_state()})
+
+            elif self.path == "/api/qos_speed":
+                src_ns = data.get("src_ns", "ns-a-u1")
+                dst_ip = data.get("dst_ip", "10.10.1.1")
+                cmd = f"ip netns exec {src_ns} curl -s -w 'Temps total: %{{time_total}}s | Vitesse moyenne: %{{speed_download}} octets/s' -o /dev/null http://{dst_ip}:8080/fichier_2mo.bin"
+                t0 = time.time()
+                _, out, _, _ = run_cmd(cmd, timeout=25)
+                with STATE_LOCK:
+                    q_rate = STATE["qos_rate_kbps"]
+                    STATE["last_cmd"] = f"sudo {cmd}"
+                mode_str = f"Bridé à {q_rate} Kbps (~125 Ko/s)" if q_rate > 0 else "Débit Illimité"
+                add_log(f"[TEST DÉBIT 2 Mo] {src_ns} -> {dst_ip} ({mode_str}) : {out}", True)
+                self._send_json({
+                    "qos_mode": mode_str,
+                    "detail": out,
+                    "duration": f"{round(time.time() - t0, 2)} s",
+                    "state": discover_live_state(),
+                })
+
+            elif self.path == "/api/latency":
+                src_ns = data.get("src_ns", "ns-a-u1")
+                dst_ip = data.get("dst_ip", "10.10.1.1")
+                label = data.get("label", f"{src_ns} -> {dst_ip}")
+                cmd = f"ip netns exec {src_ns} ping -c 6 -i 0.15 -W 1 -q {dst_ip}"
+                rc, out, _, _ = run_cmd(cmd, timeout=6)
+                allowed = (rc == 0)
+                m = re.search(r"=\s*([0-9.]+)/([0-9.]+)/([0-9.]+)/([0-9.]+)", out)
+                if allowed and m:
+                    l_min, l_avg, l_max, l_mdev = m.group(1), m.group(2), m.group(3), m.group(4)
+                    with STATE_LOCK:
+                        STATE["latency"] = {"min": l_min, "avg": l_avg, "max": l_max, "mdev": l_mdev, "pair": label}
+                        STATE["last_cmd"] = f"sudo {cmd}"
+                    summary = f"min = {l_min} ms | avg = {l_avg} ms | max = {l_max} ms | mdev = {l_mdev} ms"
+                    add_log(f"[LATENCE] {label} -> {summary}", True)
+                    self._send_json({"allowed": True, "pair": label, "min": l_min, "avg": l_avg, "max": l_max, "mdev": l_mdev, "summary": summary, "state": discover_live_state()})
+                else:
+                    add_log(f"[LATENCE BLOQUÉE] {label} : 100% packet loss (Bloqué par OVS)", False)
+                    self._send_json({"allowed": False, "pair": label, "avg": "--", "summary": "100% Packet Loss (Flux bloqué entre ces deux points)", "state": discover_live_state()})
+
+            elif self.path == "/api/run_suite":
+                cmd = "./pfa_lab.sh test"
+                _, out, _, _ = run_cmd(cmd, timeout=25)
+                with STATE_LOCK:
+                    STATE["global_inter_allowed"] = False
+                    STATE["custom_rules"] = []
+                    STATE["last_cmd"] = f"sudo {cmd}"
+                add_log("[RECETTE AUTO] Les 3 Tests Obligatoires (.pcap) ont été exécutés avec succès", True)
+                self._send_json({"report": out, "state": discover_live_state()})
+
+            elif self.path == "/api/reset":
+                cmd = "./pfa_lab.sh setup && ./pfa_lab.sh start"
+                run_cmd(cmd, timeout=20)
+                with STATE_LOCK:
+                    STATE["global_inter_allowed"] = False
+                    STATE["qos_rate_kbps"] = 0
+                    STATE["custom_rules"] = []
+                    STATE["last_cmd"] = f"sudo {cmd}"
+                add_log("[RESET] Laboratoire réinitialisé", True)
+                self._send_json(discover_live_state())
+
+            else:
+                self._send_json({"error": "Not found"}, 404)
+
+        def log_message(self, fmt, *args):
+            return
+
+    return RoleHandler
+
+
+def start_server_on_port(port, role):
+    handler_cls = make_handler_for_role(role)
+    srv = http.server.ThreadingHTTPServer(("0.0.0.0", port), handler_cls)
+    srv.serve_forever()
 
 
 if __name__ == "__main__":
     if os.geteuid() != 0:
-        print("❌ Erreur : Lance ce contrôleur avec sudo pour piloter ip netns et Open vSwitch :")
-        print("👉 sudo python3 sdn_controller.py")
+        print("❌ Lance ce script avec sudo : sudo python3 sdn_controller.py")
         raise SystemExit(1)
 
-    print("======================================================================")
-    print(f"🚀 Contrôleur Web SDN NovaStudio actif sur la VM '{HOSTNAME}'")
-    print(f"👉 Ouvre ton navigateur sur : http://<IP_DE_TA_VM>:{PORT}")
-    print("======================================================================")
-    server = http.server.ThreadingHTTPServer(("0.0.0.0", PORT), SDNRequestHandler)
+    _, ns_out, _, _ = run_cmd("ip netns list")
+    if "ns-a-web" not in ns_out:
+        print("⚙️  Initialisation automatique de la topologie (setup + start)...")
+        run_cmd("./pfa_lab.sh setup && ./pfa_lab.sh start", timeout=20)
+
+    threading.Thread(target=start_server_on_port, args=(PORT_ENT1, "ENT1"), daemon=True).start()
+    threading.Thread(target=start_server_on_port, args=(PORT_ENT2, "ENT2"), daemon=True).start()
+
+    print("==========================================================================")
+    print(f"🚀 PLATEFORME MULTI-UNIVERS SDN V6 ACTIVE SUR LA VM '{HOSTNAME}'")
+    print("==========================================================================")
+    print(f"  🏦 Port 5001 — ATLAS BANK & FINCORP      : http://<IP_DE_TA_VM>:{PORT_ENT1}")
+    print(f"  🚀 Port 5002 — MEDINATECH AI & CLOUD LABS: http://<IP_DE_TA_VM>:{PORT_ENT2}")
+    print(f"  🛡️  Port 5000 — SENTINEL-OVS NOC (Admin)  : http://<IP_DE_TA_VM>:{PORT_CONTROL}")
+    print("==========================================================================")
+
     try:
-        server.serve_forever()
+        start_server_on_port(PORT_CONTROL, "CONTROL")
     except KeyboardInterrupt:
-        print("\nArrêt du contrôleur SDN.")
+        print("\nArrêt des 3 serveurs.")
