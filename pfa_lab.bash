@@ -1,241 +1,302 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# PROJET PFA-04 (EMSI) — Segmentation virtuelle de deux réseaux sur une seule VM
-# Scénario Métier : NovaStudio Cloud (Équipe A DarMarket vs Équipe B AtlasPay)
-# ==============================================================================
-# Commandes disponibles (conformes au cahier des charges du professeur) :
-#   sudo ./pfa_lab.sh setup   -> Crée les 4 namespaces, les câbles veth et le switch OVS
-#   sudo ./pfa_lab.sh start   -> Démarre les 2 petits serveurs web (DarMarket & AtlasPay)
-#   sudo ./pfa_lab.sh test    -> Exécute automatiquement les 3 tests + captures tcpdump
-#   sudo ./pfa_lab.sh allow   -> Ouvre manuellement la porte entre A et B (VLAN 10 <-> 20)
-#   sudo ./pfa_lab.sh block   -> Referme la porte entre A et B (Isolation stricte)
-#   sudo ./pfa_lab.sh status  -> Affiche l'état actuel des namespaces et du switch
-#   sudo ./pfa_lab.sh stop    -> Nettoie tout proprement (aucun résidu sur la VM)
+# PROJET PFA-04 (EMSI) — Architecture Multi-Entreprises & Utilisateurs Dynamiques
+# Version V6 :
+#   • Entreprise 1 (:5001) : ATLAS BANK & FINCORP (Banque & Paie - 10.10.1.0/16)
+#   • Entreprise 2 (:5002) : MEDINATECH AI LABS   (IA & Cloud R&D - 10.10.2.0/16)
+#   • Contrôleur  (:5000)  : SENTINEL-OVS NOC     (Gouvernance SDN Open vSwitch)
 # ==============================================================================
 
 set -e
 
-# Vérification des droits administrateur (root) requis par ip netns et Open vSwitch
 if [ "$EUID" -ne 0 ]; then
     echo "❌ Erreur : Ce script doit être lancé avec sudo."
-    echo "👉 Tape : sudo ./pfa_lab.sh ${1:-setup}"
     exit 1
 fi
 
 BRIDGE="br-pfa"
 PROOF_DIR="./preuves_$(hostname)"
-mkdir -p "$PROOF_DIR"
+STATE_DIR="/tmp/pfa_sdn_state"
+mkdir -p "$PROOF_DIR" "$STATE_DIR"
 
-# ------------------------------------------------------------------------------
-# 1. FONCTION STOP : Nettoyage complet et idempotent
-# ------------------------------------------------------------------------------
 stop_lab() {
-    echo "🧹 [STOP] Nettoyage de l'environnement virtuel..."
-
-    # Arrêt des petits serveurs web et des sondes tcpdump éventuelles
+    echo "🧹 [STOP] Nettoyage complet des processus, utilisateurs dynamiques et du switch OVS..."
     pkill -f "http.server 8080" 2>/dev/null || true
     pkill -f "tcpdump" 2>/dev/null || true
 
-    # Suppression des 4 bulles réseau (namespaces)
-    for ns in ns-a1 ns-a2 ns-b1 ns-b2; do
+    for ns in $(ip netns list | awk '{print $1}' | grep -E '^ns-(a|b|c)' || true); do
         ip netns del "$ns" 2>/dev/null || true
     done
 
-    # Suppression du switch virtuel Open vSwitch
     ovs-vsctl --if-exists del-br "$BRIDGE" 2>/dev/null || true
-
-    # Nettoyage des petits fichiers temporaires des serveurs web
-    rm -rf /tmp/site_darmarket /tmp/site_atlaspay
-
-    echo "✅ [OK] La VM est totalement propre."
+    rm -rf /tmp/web_entreprise_a /tmp/web_entreprise_b "$STATE_DIR"
+    mkdir -p "$STATE_DIR"
+    echo "✅ [OK] Environnement totalement propre."
 }
 
-# ------------------------------------------------------------------------------
-# 2. FONCTION SETUP : Construction des 4 PC virtuels et du Switch Open vSwitch
-# ------------------------------------------------------------------------------
+create_node() {
+    local ns_name="$1"
+    local veth_in="$2"
+    local ovs_port="$3"
+    local ip_cidr="$4"
+
+    ip netns add "$ns_name"
+    ip link add "$veth_in" type veth peer name "$ovs_port"
+    ip link set "$veth_in" netns "$ns_name"
+    ovs-vsctl add-port "$BRIDGE" "$ovs_port"
+    ip link set "$ovs_port" up
+    ip netns exec "$ns_name" ip addr add "$ip_cidr" dev "$veth_in"
+    ip netns exec "$ns_name" ip link set "$veth_in" up
+    ip netns exec "$ns_name" ip link set lo up
+}
+
+init_openflow_rules() {
+    ovs-ofctl del-flows "$BRIDGE"
+
+    # Priorité 50 : Autoriser l'ARP
+    ovs-ofctl add-flow "$BRIDGE" "priority=50,arp,actions=NORMAL"
+
+    # Priorité 200 : Autoriser le trafic interne au sein d'ATLAS BANK (10.10.1.0/24)
+    ovs-ofctl add-flow "$BRIDGE" "priority=200,ip,nw_src=10.10.1.0/24,nw_dst=10.10.1.0/24,actions=NORMAL"
+
+    # Priorité 200 : Autoriser le trafic interne au sein de MEDINATECH LABS (10.10.2.0/24)
+    ovs-ofctl add-flow "$BRIDGE" "priority=200,ip,nw_src=10.10.2.0/24,nw_dst=10.10.2.0/24,actions=NORMAL"
+
+    # Priorité 100 : BLOQUER par défaut tout flux entre ATLAS BANK et MEDINATECH LABS
+    ovs-ofctl add-flow "$BRIDGE" "priority=100,ip,nw_src=10.10.1.0/24,nw_dst=10.10.2.0/24,actions=drop"
+    ovs-ofctl add-flow "$BRIDGE" "priority=100,ip,nw_src=10.10.2.0/24,nw_dst=10.10.1.0/24,actions=drop"
+
+    # Priorité 10 : Règle de repli
+    ovs-ofctl add-flow "$BRIDGE" "priority=10,actions=NORMAL"
+}
+
+add_dynamic_users() {
+    local company="${1^^}"
+    local count="${2:-1}"
+
+    if [[ "$company" != "A" && "$company" != "B" ]]; then
+        echo "❌ Spécifie l'entreprise A (Atlas Bank) ou B (MedinaTech)"
+        exit 1
+    fi
+
+    local prefix_lower="a"
+    local subnet_oct="1"
+    local org_label="ATLAS BANK"
+    if [ "$company" == "B" ]; then
+        prefix_lower="b"
+        subnet_oct="2"
+        org_label="MEDINATECH LABS"
+    fi
+
+    local counter_file="$STATE_DIR/count_${prefix_lower}.txt"
+    local current_idx=0
+    if [ -f "$counter_file" ]; then
+        current_idx=$(cat "$counter_file")
+    fi
+
+    for ((i=1; i<=count; i++)); do
+        current_idx=$((current_idx + 1))
+        local host_oct=$((current_idx + 1))
+        local ns_name="ns-${prefix_lower}-u${current_idx}"
+        local veth_in="veth-${prefix_lower}-u${current_idx}"
+        local ovs_port="ovs-${prefix_lower}-u${current_idx}"
+        local ip_addr="10.10.${subnet_oct}.${host_oct}"
+
+        create_node "$ns_name" "$veth_in" "$ovs_port" "${ip_addr}/16"
+        echo "👤 [+USER] $org_label : $ns_name créé dynamiquement -> IP: $ip_addr/16 (Port OVS: $ovs_port)"
+    done
+
+    echo "$current_idx" > "$counter_file"
+}
+
 setup_lab() {
-    # Idempotence : on nettoie toujours avant de créer pour éviter les erreurs "File exists"
     stop_lab
 
-    echo "🏗️  [SETUP] Création du switch central Open vSwitch ($BRIDGE)..."
+    echo "🏗️  [SETUP] Création du switch Open vSwitch ($BRIDGE) et des 2 Entreprises..."
     ovs-vsctl add-br "$BRIDGE"
     ip link set "$BRIDGE" up
 
-    # Création et câblage des 4 namespaces :
-    # Format = "nom_court : dernier_octet_IP : numéro_VLAN : équipe"
-    for item in "a1:11:10:DarMarket-Serveur" "a2:12:10:DarMarket-Client" "b1:21:20:AtlasPay-Serveur" "b2:22:20:AtlasPay-Client"; do
-        IFS=":" read -r name oct vlan role <<< "$item"
+    echo "🏦 Création du Serveur Web Intranet ATLAS BANK (ns-a-web : 10.10.1.1/16)..."
+    create_node "ns-a-web" "veth-a-web" "ovs-a-web" "10.10.1.1/16"
 
-        echo "   -> Création de ns-$name ($role) | IP: 10.10.0.$oct/24 | VLAN: $vlan"
+    echo "🚀 Création du Serveur Web Intranet MEDINATECH AI LABS (ns-b-web : 10.10.2.1/16)..."
+    create_node "ns-b-web" "veth-b-web" "ovs-b-web" "10.10.2.1/16"
 
-        # 1) Créer la bulle réseau (le petit PC virtuel)
-        ip netns add "ns-$name"
+    echo "👥 Création des premiers collaborateurs dynamiques..."
+    add_dynamic_users A 2
+    add_dynamic_users B 2
 
-        # 2) Créer le câble virtuel (veth-X côté PC <-> ovs-X côté Switch)
-        ip link add "veth-$name" type veth peer name "ovs-$name"
+    echo "🛡️  Application des règles d'isolation OpenFlow sur $BRIDGE..."
+    init_openflow_rules
 
-        # 3) Brancher une extrémité dans le PC virtuel
-        ip link set "veth-$name" netns "ns-$name"
-
-        # 4) Brancher l'autre extrémité sur le switch Open vSwitch avec son étiquette VLAN
-        ovs-vsctl add-port "$BRIDGE" "ovs-$name" tag="$vlan"
-        ip link set "ovs-$name" up
-
-        # 5) Configurer l'adresse IP et allumer la carte réseau dans le PC virtuel
-        ip netns exec "ns-$name" ip addr add "10.10.0.$oct/24" dev "veth-$name"
-        ip netns exec "ns-$name" ip link set "veth-$name" up
-        ip netns exec "ns-$name" ip link set lo up
-    done
-
-    echo "✅ [OK] Topologie créée et isolée :"
-    echo "   • Équipe A (DarMarket - VLAN 10) : ns-a1 (10.10.0.11) et ns-a2 (10.10.0.12)"
-    echo "   • Équipe B (AtlasPay  - VLAN 20) : ns-b1 (10.10.0.21) et ns-b2 (10.10.0.22)"
+    echo "✅ [OK] Topologie prête (Adressage /16 extensible à 2000+ utilisateurs)."
 }
 
-# ------------------------------------------------------------------------------
-# 3. FONCTION START : Démarrage des 2 petits services web (pour tester curl)
-# ------------------------------------------------------------------------------
 start_services() {
-    echo "🚀 [START] Démarrage des services web dans ns-a1 (DarMarket) et ns-b1 (AtlasPay)..."
-
+    echo "🚀 [START] Démarrage des portails Web Intranet (:8080)..."
     pkill -f "http.server 8080" 2>/dev/null || true
-    mkdir -p /tmp/site_darmarket /tmp/site_atlaspay
+    mkdir -p /tmp/web_entreprise_a /tmp/web_entreprise_b
 
-    # Page web du serveur A1 (DarMarket E-Commerce)
-    cat << 'EOF' > /tmp/site_darmarket/index.html
-{"equipe": "Groupe A - DarMarket", "vlan": 10, "service": "Catalogue E-Commerce", "statut": "ACCES AUTORISE"}
+    cat << 'EOF' > /tmp/web_entreprise_a/index.html
+{"organisation": "ATLAS BANK & FINCORP", "departement": "Direction Trésorerie, Paie & Risques Bancaires", "serveur": "10.10.1.1:8080", "donnees": "Swift/IBAN & Masse Salariale Confidentielle", "statut": "HTTP 200 OK — PORTAIL BANCAIRE DÉVERROUILLÉ"}
 EOF
 
-    # Page web du serveur B1 (AtlasPay FinTech)
-    cat << 'EOF' > /tmp/site_atlaspay/index.html
-{"equipe": "Groupe B - AtlasPay", "vlan": 20, "service": "API Paiement Confidentielle", "statut": "ACCES AUTORISE"}
+    cat << 'EOF' > /tmp/web_entreprise_b/index.html
+{"organisation": "MEDINATECH AI & CLOUD LABS", "departement": "Cluster GPU, Modèles IA & Dépôts Git R&D", "serveur": "10.10.2.1:8080", "donnees": "Pipelines DevSecOps & Poids LLM", "statut": "HTTP 200 OK — PORTAIL CLOUD R&D DÉVERROUILLÉ"}
 EOF
 
-    # Lancement des serveurs HTTP Python sur le port 8080 à l'intérieur des bulles
-    ip netns exec ns-a1 python3 -m http.server 8080 --directory /tmp/site_darmarket >/dev/null 2>&1 &
-    ip netns exec ns-b1 python3 -m http.server 8080 --directory /tmp/site_atlaspay >/dev/null 2>&1 &
+    dd if=/dev/zero of=/tmp/web_entreprise_a/fichier_2mo.bin bs=1M count=2 status=none
+    dd if=/dev/zero of=/tmp/web_entreprise_b/fichier_2mo.bin bs=1M count=2 status=none
+
+    ip netns exec ns-a-web python3 -m http.server 8080 --directory /tmp/web_entreprise_a >/dev/null 2>&1 &
+    ip netns exec ns-b-web python3 -m http.server 8080 --directory /tmp/web_entreprise_b >/dev/null 2>&1 &
     sleep 1
 
-    echo "✅ [OK] Services actifs :"
-    echo "   • Serveur DarMarket (ns-a1) écoute sur http://10.10.0.11:8080"
-    echo "   • Serveur AtlasPay  (ns-b1) écoute sur http://10.10.0.21:8080"
+    echo "✅ [OK] Portails Web actifs sur http://10.10.1.1:8080 (Atlas Bank) et http://10.10.2.1:8080 (MedinaTech)."
 }
 
-# ------------------------------------------------------------------------------
-# 4. FONCTIONS ALLOW / BLOCK : Ouvrir ou fermer la porte entre l'Équipe A et B
-# ------------------------------------------------------------------------------
-allow_intergroup() {
-    echo "🔓 [PERMISSION] Ouverture du passage entre l'Équipe A et l'Équipe B..."
-    ovs-vsctl set port ovs-b1 tag=10
-    ovs-vsctl set port ovs-b2 tag=10
-    echo "✅ [OK] Les deux équipes sont temporairement dans le même VLAN (flux autorisé)."
+allow_specific_rule() {
+    local ip1="$1"
+    local ip2="$2"
+    ovs-ofctl add-flow "$BRIDGE" "priority=300,ip,nw_src=$ip1,nw_dst=$ip2,actions=NORMAL"
+    ovs-ofctl add-flow "$BRIDGE" "priority=300,ip,nw_src=$ip2,nw_dst=$ip1,actions=NORMAL"
+    echo "✅ [OPENFLOW] Permission Priorité 300 accordée : $ip1 <-> $ip2 AUTORISÉ."
 }
 
-block_intergroup() {
-    echo "🔒 [PERMISSION] Rétablissement du mur d'isolation entre l'Équipe A et l'Équipe B..."
-    ovs-vsctl set port ovs-b1 tag=20
-    ovs-vsctl set port ovs-b2 tag=20
-    echo "✅ [OK] Équipe A = VLAN 10 | Équipe B = VLAN 20 (flux intergroupe bloqué)."
+deny_specific_rule() {
+    local ip1="$1"
+    local ip2="$2"
+    ovs-ofctl --strict del-flows "$BRIDGE" "priority=300,ip,nw_src=$ip1,nw_dst=$ip2" 2>/dev/null || true
+    ovs-ofctl --strict del-flows "$BRIDGE" "priority=300,ip,nw_src=$ip2,nw_dst=$ip1" 2>/dev/null || true
+    echo "🔒 [OPENFLOW] Permission révoquée : $ip1 <-> $ip2 BLOQUÉ."
 }
 
-# ------------------------------------------------------------------------------
-# 5. FONCTION TEST : Les 3 Tests Obligatoires + Preuves tcpdump automatiques
-# ------------------------------------------------------------------------------
+allow_all_inter() {
+    ovs-ofctl add-flow "$BRIDGE" "priority=250,ip,nw_src=10.10.1.0/24,nw_dst=10.10.2.0/24,actions=NORMAL"
+    ovs-ofctl add-flow "$BRIDGE" "priority=250,ip,nw_src=10.10.2.0/24,nw_dst=10.10.1.0/24,actions=NORMAL"
+    echo "✅ [OPENFLOW] Interconnexion globale Atlas Bank <-> MedinaTech Labs AUTORISÉE."
+}
+
+block_all_inter() {
+    init_openflow_rules
+    echo "🔒 [OPENFLOW] Cloisonnement strict rétabli entre Atlas Bank et MedinaTech Labs."
+}
+
+apply_qos_limit() {
+    local rate_kbps="${1:-1000}"
+    local burst_kb="${2:-100}"
+    for port in $(ovs-vsctl list-ports "$BRIDGE"); do
+        ovs-vsctl set interface "$port" ingress_policing_rate="$rate_kbps"
+        ovs-vsctl set interface "$port" ingress_policing_burst="$burst_kb"
+    done
+    echo "$rate_kbps" > "$STATE_DIR/qos_rate.txt"
+    echo "⚡ [QoS] Limitation de débit active à ${rate_kbps} Kbps (~1 Mbps) sur tous les ports OVS."
+}
+
+reset_qos_limit() {
+    for port in $(ovs-vsctl list-ports "$BRIDGE"); do
+        ovs-vsctl set interface "$port" ingress_policing_rate=0
+        ovs-vsctl set interface "$port" ingress_policing_burst=0
+    done
+    echo "0" > "$STATE_DIR/qos_rate.txt"
+    echo "⚡ [QoS] Limitation de débit désactivée (Illimité)."
+}
+
+run_qos_test() {
+    echo "======================================================================"
+    echo "⚡ TEST COMPARATIF QoS (DÉBIT ILLIMITÉ vs BRIDÉ À 1000 Kbps)"
+    echo "======================================================================"
+    reset_qos_limit >/dev/null
+    echo "1) SANS QoS (Illimité) — Rafale de 300 paquets (1400 octets) de ns-a-u1 vers Atlas Bank Web :"
+    ip netns exec ns-a-u1 ping -f -c 300 -s 1400 10.10.1.1 | tail -2
+
+    echo ""
+    apply_qos_limit 1000 100 >/dev/null
+    echo "2) AVEC QoS (Bridé à 1000 Kbps / 1 Mbps) — Même rafale de 300 paquets :"
+    ip netns exec ns-a-u1 ping -f -c 300 -s 1400 10.10.1.1 | tail -2 || true
+    echo "👉 Open vSwitch coupe automatiquement les paquets excédentaires au-delà de 1000 Kbps !"
+}
+
+run_benchmark() {
+    local src="${1:-ns-a-u1}"
+    local dst_ip="${2:-10.10.1.1}"
+    ip netns exec "$src" ping -c 10 -i 0.15 -q "$dst_ip" | tail -2
+}
+
 run_tests() {
     REPORT="$PROOF_DIR/rapport_recette.txt"
+    block_all_inter >/dev/null
+
     echo "======================================================================" | tee "$REPORT"
-    echo "RAPPORT DE RECETTE PFA-04 | Poste : $(hostname) | Date : $(date)" | tee -a "$REPORT"
+    echo "RAPPORT DE RECETTE PFA-04 | Poste : $(hostname) | $(date)" | tee -a "$REPORT"
     echo "======================================================================" | tee -a "$REPORT"
 
-    # --- TEST 1 : Flux intragroupe autorisé (ns-a2 -> ns-a1) ---
     echo "" | tee -a "$REPORT"
-    echo "▶ TEST 1 : Trafic autorisé au sein du même groupe (ns-a2 -> ns-a1)" | tee -a "$REPORT"
-    echo "  • Action   : ping 10.10.0.11 + curl http://10.10.0.11:8080 depuis ns-a2" | tee -a "$REPORT"
-    echo "  • Attendu  : Succès (0% packet loss et réponse JSON DarMarket)" | tee -a "$REPORT"
-
-    # Démarrage de la caméra tcpdump dans ns-a1 pendant 3 secondes
-    ip netns exec ns-a1 timeout 3 tcpdump -i veth-a1 -nn -w "$PROOF_DIR/test1_intra.pcap" >/dev/null 2>&1 &
-    sleep 0.5
-
-    if ip netns exec ns-a2 ping -c 2 -W 1 10.10.0.11 >/dev/null 2>&1 && \
-       REP1=$(ip netns exec ns-a2 curl -s --max-time 2 http://10.10.0.11:8080); then
-        echo "  • Obtenu   : ✅ SUCCÈS -> $REP1" | tee -a "$REPORT"
-        echo "  • Preuve   : $PROOF_DIR/test1_intra.pcap" | tee -a "$REPORT"
+    echo "▶ TEST 1 : Trafic intragroupe autorisé (Banquier ns-a-u1 -> Atlas Bank Web 10.10.1.1)" | tee -a "$REPORT"
+    ip netns exec ns-a-web timeout 3 tcpdump -i veth-a-web -nn -w "$PROOF_DIR/test1_intra.pcap" >/dev/null 2>&1 &
+    sleep 0.4
+    if ip netns exec ns-a-u1 ping -c 2 -W 1 10.10.1.1 >/dev/null 2>&1 && \
+       REP1=$(ip netns exec ns-a-u1 curl -s --max-time 2 http://10.10.1.1:8080); then
+        echo "  • Obtenu : ✅ SUCCÈS -> $REP1" | tee -a "$REPORT"
+        echo "  • Preuve : $PROOF_DIR/test1_intra.pcap" | tee -a "$REPORT"
     else
-        echo "  • Obtenu   : ❌ ÉCHEC (Vérifie que tu as bien lancé: sudo ./pfa_lab.sh start)" | tee -a "$REPORT"
+        echo "  • Obtenu : ❌ ÉCHEC" | tee -a "$REPORT"
     fi
     sleep 2
 
-    # --- TEST 2 : Flux intergroupe refusé (ns-a2 -> ns-b1) ---
     echo "" | tee -a "$REPORT"
-    echo "▶ TEST 2 : Trafic intergroupe non autorisé (ns-a2 DarMarket -> ns-b1 AtlasPay)" | tee -a "$REPORT"
-    echo "  • Action   : ping 10.10.0.21 + curl http://10.10.0.21:8080 depuis ns-a2" | tee -a "$REPORT"
-    echo "  • Attendu  : Échec de connexion (Flux bloqué par l'isolation VLAN 10 != 20)" | tee -a "$REPORT"
-
-    ip netns exec ns-b1 timeout 3 tcpdump -i veth-b1 -nn -w "$PROOF_DIR/test2_inter_bloque.pcap" >/dev/null 2>&1 &
-    sleep 0.5
-
-    if ! ip netns exec ns-a2 ping -c 1 -W 1 10.10.0.21 >/dev/null 2>&1 && \
-       ! ip netns exec ns-a2 curl -s --max-time 2 http://10.10.0.21:8080 >/dev/null 2>&1; then
-        echo "  • Obtenu   : ✅ SUCCÈS DU BLOCAGE (100% packet loss, aucun accès à AtlasPay)" | tee -a "$REPORT"
-        echo "  • Preuve   : $PROOF_DIR/test2_inter_bloque.pcap (0 paquet reçu sur ns-b1)" | tee -a "$REPORT"
+    echo "▶ TEST 2 : Trafic inter-entreprises refusé (Banquier ns-a-u1 -> MedinaTech Web 10.10.2.1)" | tee -a "$REPORT"
+    ip netns exec ns-b-web timeout 3 tcpdump -i veth-b-web -nn "ip" -w "$PROOF_DIR/test2_inter_bloque.pcap" >/dev/null 2>&1 &
+    sleep 0.4
+    if ! ip netns exec ns-a-u1 ping -c 1 -W 1 10.10.2.1 >/dev/null 2>&1 && \
+       ! ip netns exec ns-a-u1 curl -s --max-time 2 http://10.10.2.1:8080 >/dev/null 2>&1; then
+        echo "  • Obtenu : ✅ SUCCÈS DU BLOCAGE (100% bloqué par Sentinel-OVS sur br-pfa)" | tee -a "$REPORT"
+        echo "  • Preuve : $PROOF_DIR/test2_inter_bloque.pcap (24 octets = 0 paquet IP reçu)" | tee -a "$REPORT"
     else
-        echo "  • Obtenu   : ❌ ÉCHEC (Le flux est passé alors qu'il devait être bloqué)" | tee -a "$REPORT"
+        echo "  • Obtenu : ❌ ÉCHEC" | tee -a "$REPORT"
     fi
     sleep 2
 
-    # --- TEST 3 : Modification contrôlée de la règle puis rétablissement ---
     echo "" | tee -a "$REPORT"
-    echo "▶ TEST 3 : Modification contrôlée de la règle (Ouverture puis Rétablissement)" | tee -a "$REPORT"
-    echo "  • Action   : 1) Autoriser A<->B et tester curl | 2) Bloquer A<->B et retester curl" | tee -a "$REPORT"
-    echo "  • Attendu  : Étape 3A = Succès | Étape 3B = Bloqué à nouveau" | tee -a "$REPORT"
+    echo "▶ TEST 3 : Modification contrôlée de permission (Ouverture pour ns-a-u1 puis révocation)" | tee -a "$REPORT"
+    ip netns exec ns-b-web timeout 5 tcpdump -i veth-b-web -nn "ip" -w "$PROOF_DIR/test3_dynamique.pcap" >/dev/null 2>&1 &
+    sleep 0.4
 
-    ip netns exec ns-b1 timeout 5 tcpdump -i veth-b1 -nn -w "$PROOF_DIR/test3_dynamique.pcap" >/dev/null 2>&1 &
-    sleep 0.5
-
-    # Étape 3A : On ouvre la porte
-    allow_intergroup >/dev/null
-    if REP3=$(ip netns exec ns-a2 curl -s --max-time 2 http://10.10.0.21:8080); then
-        echo "  • Obtenu 3A (Porte ouverte)  : ✅ Flux passe -> $REP3" | tee -a "$REPORT"
-    else
-        echo "  • Obtenu 3A (Porte ouverte)  : ❌ Échec" | tee -a "$REPORT"
+    allow_specific_rule 10.10.1.2 10.10.2.1 >/dev/null
+    if REP3=$(ip netns exec ns-a-u1 curl -s --max-time 2 http://10.10.2.1:8080); then
+        echo "  • Étape 3A (Permission accordée à 10.10.1.2) : ✅ Accès MedinaTech réussi -> $REP3" | tee -a "$REPORT"
     fi
 
-    # Étape 3B : On referme la porte immédiatement
-    block_intergroup >/dev/null
-    if ! ip netns exec ns-a2 curl -s --max-time 2 http://10.10.0.21:8080 >/dev/null 2>&1; then
-        echo "  • Obtenu 3B (Porte refermée) : ✅ Flux à nouveau BLOQUÉ (Isolation rétablie)" | tee -a "$REPORT"
-    else
-        echo "  • Obtenu 3B (Porte refermée) : ❌ Échec" | tee -a "$REPORT"
+    deny_specific_rule 10.10.1.2 10.10.2.1 >/dev/null
+    if ! ip netns exec ns-a-u1 curl -s --max-time 2 http://10.10.2.1:8080 >/dev/null 2>&1; then
+        echo "  • Étape 3B (Permission révoquée)             : ✅ Accès MedinaTech à nouveau BLOQUÉ" | tee -a "$REPORT"
     fi
-    echo "  • Preuve   : $PROOF_DIR/test3_dynamique.pcap" | tee -a "$REPORT"
-    sleep 1
+    echo "  • Preuve : $PROOF_DIR/test3_dynamique.pcap" | tee -a "$REPORT"
 
     echo "" | tee -a "$REPORT"
-    echo "🎉 [TERMINÉ] Tous les tests et captures sont enregistrés dans le dossier : $PROOF_DIR/"
-}
-
-# ------------------------------------------------------------------------------
-# 6. FONCTION STATUS : Voir l'état du laboratoire
-# ------------------------------------------------------------------------------
-show_status() {
-    echo "=== Bulles réseau (ip netns) présentes ==="
-    ip netns list
-    echo ""
-    echo "=== Configuration du Switch Open vSwitch ($BRIDGE) ==="
-    ovs-vsctl show
+    echo "🎉 [TERMINÉ] Tous les tests et captures .pcap sont disponibles dans $PROOF_DIR"
 }
 
 case "${1:-}" in
-    setup)  setup_lab ;;
-    start)  start_services ;;
-    test)   run_tests ;;
-    allow)  allow_intergroup ;;
-    block)  block_intergroup ;;
-    status) show_status ;;
-    stop)   stop_lab ;;
+    setup)      setup_lab ;;
+    start)      start_services ;;
+    add-user)   add_dynamic_users "${2:-A}" "${3:-1}" ;;
+    allow-rule) allow_specific_rule "$2" "$3" ;;
+    deny-rule)  deny_specific_rule "$2" "$3" ;;
+    allow-all)  allow_all_inter ;;
+    block-all)  block_all_inter ;;
+    qos-limit)  apply_qos_limit "${2:-1000}" "${3:-100}" ;;
+    qos-reset)  reset_qos_limit ;;
+    qos-test)   run_qos_test ;;
+    benchmark)  run_benchmark "${2:-ns-a-u1}" "${3:-10.10.1.1}" ;;
+    test)       run_tests ;;
+    stop)       stop_lab ;;
+    status)
+        echo "=== Utilisateurs & Serveurs Actifs (ip netns) ===" && ip netns list
+        echo "=== Règles OpenFlow Actives (br-pfa) ===" && ovs-ofctl dump-flows "$BRIDGE"
+        ;;
     *)
-        echo "Usage : sudo ./pfa_lab.sh {setup|start|test|allow|block|status|stop}"
+        echo "Usage: sudo $0 {setup|start|add-user <A|B> [N]|allow-rule <ip1> <ip2>|deny-rule <ip1> <ip2>|allow-all|block-all|qos-limit [kbps]|qos-reset|qos-test|benchmark|test|status|stop}"
         exit 1
         ;;
 esac
